@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+# Database (dont't commit - contains actual data)
+warehouse.db
+*.db
+# Logs
+*.log
+npm-debug.log*
+# DS files
+.DS_Store
+Thumbs.db
+# IDE
+.vscode/
+.idea/
+#Enviironment variables (for future use)
+.env
