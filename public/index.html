@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <tile>Warehouse Tracker</tile>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/html5-qrcode"></script>
+  </head>
+  <body class="bg-gray-100">
+    <div id="app"></div>
+
+     <script>
+    const API_URL = window.location.origin;
+    
+    const app = {
+      view: 'scan',
+      pallets: [],
+      stats: {},
+      scanMode: null,
+      tempPallet: null,
+      searchTerm: '',
+      scanner: null,
+      
+      async init() {
+        await this.loadStats();
+        await this.loadPallets();
+        this.render();
+      },
+      
+      async loadPallets() {
+        try {
+          const res = await fetch(`${API_URL}/api/pallets`);
+          this.pallets = await res.json();
+        } catch (e) {
+          console.error('Error loading pallets:', e);
+        }
+      },
+      
+      async loadStats() {
+        try {
+          const res = await fetch(`${API_URL}/api/stats`);
+          this.stats = await res.json();
+        } catch (e) {
+          console.error('Error loading stats:', e);
+        }
+      },
+      
+      async checkIn(productId, quantity, location) {
+        try {
+          const res = await fetch(`${API_URL}/api/pallets`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ product_id: productId, quantity, location })
+          });
+          const data = await res.json();
+          alert(data.message || 'Pallet checked in!');
+          await this.loadPallets();
+          await this.loadStats();
+          this.render();
+        } catch (e) {
+          alert('Error checking in pallet');
+          console.error(e);
+        }
+      },
+      
+      async checkOut(palletId) {
+        if (!confirm('Remove this pallet?')) return;
+        try {
+          const res = await fetch(`${API_URL}/api/pallets/${palletId}`, { method: 'DELETE' });
+          const data = await res.json();
+          alert(data.message || 'Pallet checked out!');
+          await this.loadPallets();
+          await this.loadStats();
+          this.render();
+        } catch (e) {
+          alert('Error checking out pallet');
+          console.error(e);
+        }
+      },
+      
+      startScanner(mode) {
+        this.scanMode = mode;
+        this.render();
+        
+        setTimeout(() => {
+          const html5QrCode = new Html5Qrcode("qr-reader");
+          this.scanner = html5QrCode;
+          
+          html5QrCode.start(
+            { facingMode: "environment" },
+            { fps: 10, qrbox: 250 },
+            (decodedText) => {
+              this.handleScan(decodedText);
+              html5QrCode.stop();
+            }
+          ).catch(err => {
+            console.error("Camera error:", err);
+            alert("Camera not available. Use manual entry.");
+            this.stopScanner();
+          });
+        }, 100);
+      },
+      
+      handleScan(code) {
+        if (this.scanMode === 'checkin-pallet') {
+          this.tempPallet = code;
+          this.stopScanner();
+          setTimeout(() => {
+            this.scanMode = 'checkin-location';
+            this.render();
+            this.startScanner('checkin-location');
+          }, 500);
+        } else if (this.scanMode === 'checkin-location') {
+          this.stopScanner();
+          const qty = prompt('Enter quantity:', '1');
+          if (qty !== null) {
+            this.checkIn(this.tempPallet, parseInt(qty) || 1, code);
+          }
+          this.scanMode = null;
+          this.tempPallet = null;
+        } else if (this.scanMode === 'checkout') {
+          this.stopScanner();
+          this.checkOut(code);
+          this.scanMode = null;
+        }
+      },
+      
+      stopScanner() {
+        if (this.scanner) {
+          try {
+            this.scanner.stop();
+          } catch (e) {
+            console.log('Scanner already stopped');
+          }
+          this.scanner = null;
+        }
+      },
+      
+      showManualEntry() {
+        const productId = prompt('Enter Product ID:');
+        if (!productId) return;
+        
+        const quantity = prompt('Enter Quantity:', '1');
+        const location = prompt('Enter Location (e.g., A1-L3):');
+        
+        if (location) {
+          this.checkIn(productId, parseInt(quantity) || 1, location);
+        }
+      },
+      
+      render() {
+        const filtered = this.pallets.filter(p => 
+          p.product_id.toLowerCase().includes(this.searchTerm.toLowerCase()) ||
+          p.location.toLowerCase().includes(this.searchTerm.toLowerCase())
+        );
+        
+        document.getElementById('app').innerHTML = `
+          <div class="bg-blue-600 text-white p-4 shadow-lg">
+            <h1 class="text-2xl font-bold">Warehouse Tracker</h1>
+            <div class="mt-2 text-sm">
+              <span class="mr-4">📦 ${this.stats.total_pallets || 0} Pallets</span>
+              <span class="mr-4">✓ ${this.stats.occupied_locations || 0} Occupied</span>
+              <span>□ ${(this.stats.total_locations || 480) - (this.stats.occupied_locations || 0)} Available</span>
+            </div>
+          </div>
+          
+          <div class="bg-white border-b sticky top-0 z-10 flex">
+            <button onclick="app.view='scan'; app.render()" class="flex-1 py-3 ${this.view === 'scan' ? 'bg-blue-50 text-blue-600 border-b-2 border-blue-600' : 'text-gray-600'}">
+              📷 Scan
+            </button>
+            <button onclick="app.view='inventory'; app.render()" class="flex-1 py-3 ${this.view === 'inventory' ? 'bg-blue-50 text-blue-600 border-b-2 border-blue-600' : 'text-gray-600'}">
+              📋 Inventory
+            </button>
+          </div>
+          
+          <div class="p-4">
+            ${this.view === 'scan' ? this.renderScan() : this.renderInventory(filtered)}
+          </div>
+        `;
+      },
+      
+      renderScan() {
+        if (!this.scanMode) {
+          return `
+            <div class="space-y-3">
+              <button onclick="app.startScanner('checkin-pallet')" class="w-full bg-green-500 text-white p-4 rounded-lg shadow hover:bg-green-600 text-lg">
+                ✓ Check In Pallet
+              </button>
+              <button onclick="app.startScanner('checkout')" class="w-full bg-red-500 text-white p-4 rounded-lg shadow hover:bg-red-600 text-lg">
+                ✗ Check Out Pallet
+              </button>
+              <button onclick="app.showManualEntry()" class="w-full bg-gray-500 text-white p-4 rounded-lg shadow hover:bg-gray-600 text-lg">
+                ✎ Manual Entry
+              </button>
+            </div>
+          `;
+        } else {
+          return `
+            <div class="space-y-4">
+              <div class="bg-white p-4 rounded-lg shadow">
+                <h3 class="font-bold mb-2 text-lg">
+                  ${this.scanMode === 'checkin-pallet' ? '📦 Step 1: Scan Pallet QR Code' : 
+                    this.scanMode === 'checkin-location' ? '📍 Step 2: Scan Location QR Code' : 
+                    '📦 Scan Pallet to Remove'}
+                </h3>
+                ${this.tempPallet ? `<p class="text-green-600 font-semibold">✓ Pallet: ${this.tempPallet}</p>` : ''}
+              </div>
+              
+              <div id="qr-reader" class="border-4 border-blue-500 rounded-lg overflow-hidden"></div>
+              
+              <button onclick="app.stopScanner(); app.scanMode = null; app.tempPallet = null; app.render()" class="w-full bg-gray-500 text-white p-3 rounded-lg text-lg">
+                Cancel
+              </button>
+            </div>
+          `;
+        }
+      },
+      
+      renderInventory(pallets) {
+        return `
+          <div class="mb-4 flex gap-2">
+            <input 
+              type="text" 
+              placeholder="Search product or location..." 
+              value="${this.searchTerm}"
+              oninput="app.searchTerm = this.value; app.render()"
+              class="flex-1 border p-3 rounded text-lg"
+            />
+            <a href="${API_URL}/api/export" download class="bg-blue-500 text-white px-4 py-3 rounded flex items-center">
+              ⬇ Export
+            </a>
+          </div>
+          
+          <div class="space-y-2">
+            ${pallets.length === 0 ? 
+              '<div class="text-center text-gray-500 py-8 text-lg">No pallets found</div>' :
+              pallets.map(p => `
+                <div class="bg-white p-4 rounded-lg shadow flex justify-between items-start">
+                  <div class="flex-1">
+                    <h3 class="font-bold text-lg">${p.product_id}</h3>
+                    <p class="text-gray-600">📍 ${p.location}</p>
+                    <p class="text-sm text-gray-500">Qty: ${p.quantity} • ${new Date(p.date_added).toLocaleDateString()}</p>
+                  </div>
+                  <button onclick="app.checkOut('${p.id}')" class="text-red-500 hover:bg-red-50 p-3 rounded text-xl">
+                    ✗
+                  </button>
+                </div>
+              `).join('')
+            }
+          </div>
+        `;
+      }
+    };
+    
+    app.init();
+  </script>
+  </body>
+</html>
