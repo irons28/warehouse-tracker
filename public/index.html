@@ -17,6 +17,7 @@
       view: 'scan',
       pallets: [],
       stats: {},
+      activityLog: [],
       scanMode: null,
       tempPallet: null,
       searchTerm: '',
@@ -25,6 +26,7 @@
       async init() {
         await this.loadStats();
         await this.loadPallets();
+        await this.loadActivity();
         this.render();
       },
       
@@ -46,17 +48,27 @@
         }
       },
       
-      async checkIn(productId, quantity, location) {
+      async loadActivity() {
+        try {
+          const res = await fetch(`${API_URL}/api/activity?limit=100`);
+          this.activityLog = await res.json();
+        } catch (e) {
+          console.error('Error loading activity:', e);
+        }
+      },
+      
+      async checkIn(customerName, productId, quantity, location) {
         try {
           const res = await fetch(`${API_URL}/api/pallets`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ product_id: productId, quantity, location })
+            body: JSON.stringify({ customer_name: customerName, product_id: productId, quantity, location })
           });
           const data = await res.json();
           alert(data.message || 'Pallet checked in!');
           await this.loadPallets();
           await this.loadStats();
+          await this.loadActivity();
           this.render();
         } catch (e) {
           alert('Error checking in pallet');
@@ -65,16 +77,56 @@
       },
       
       async checkOut(palletId) {
-        if (!confirm('Remove this pallet?')) return;
+        if (!confirm('Remove entire pallet?')) return;
         try {
           const res = await fetch(`${API_URL}/api/pallets/${palletId}`, { method: 'DELETE' });
           const data = await res.json();
           alert(data.message || 'Pallet checked out!');
           await this.loadPallets();
           await this.loadStats();
+          await this.loadActivity();
           this.render();
         } catch (e) {
           alert('Error checking out pallet');
+          console.error(e);
+        }
+      },
+      
+      async removePartialQuantity(palletId) {
+        const pallet = this.pallets.find(p => p.id === palletId);
+        if (!pallet) {
+          alert('Pallet not found');
+          return;
+        }
+        
+        const qtyToRemove = prompt(`Current quantity: ${pallet.quantity}\n\nHow many units to remove?`, '1');
+        if (qtyToRemove === null) return;
+        
+        const qty = parseInt(qtyToRemove);
+        if (isNaN(qty) || qty <= 0) {
+          alert('Please enter a valid quantity');
+          return;
+        }
+        
+        if (qty > pallet.quantity) {
+          alert(`Cannot remove ${qty} units. Only ${pallet.quantity} available.`);
+          return;
+        }
+        
+        try {
+          const res = await fetch(`${API_URL}/api/pallets/${palletId}/remove-quantity`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ quantity_to_remove: qty })
+          });
+          const data = await res.json();
+          alert(data.message || 'Quantity removed!');
+          await this.loadPallets();
+          await this.loadStats();
+          await this.loadActivity();
+          this.render();
+        } catch (e) {
+          alert('Error removing quantity');
           console.error(e);
         }
       },
@@ -113,9 +165,11 @@
           }, 500);
         } else if (this.scanMode === 'checkin-location') {
           this.stopScanner();
+          const customerName = prompt('Enter Customer Name:');
+          if (!customerName) return;
           const qty = prompt('Enter quantity:', '1');
           if (qty !== null) {
-            this.checkIn(this.tempPallet, parseInt(qty) || 1, code);
+            this.checkIn(customerName, this.tempPallet, parseInt(qty) || 1, code);
           }
           this.scanMode = null;
           this.tempPallet = null;
@@ -138,6 +192,9 @@
       },
       
       showManualEntry() {
+        const customerName = prompt('Enter Customer Name (e.g., Godbold, Council):');
+        if (!customerName) return;
+        
         const productId = prompt('Enter Product ID:');
         if (!productId) return;
         
@@ -145,14 +202,15 @@
         const location = prompt('Enter Location (e.g., A1-L3):');
         
         if (location) {
-          this.checkIn(productId, parseInt(quantity) || 1, location);
+          this.checkIn(customerName, productId, parseInt(quantity) || 1, location);
         }
       },
       
       render() {
         const filtered = this.pallets.filter(p => 
           p.product_id.toLowerCase().includes(this.searchTerm.toLowerCase()) ||
-          p.location.toLowerCase().includes(this.searchTerm.toLowerCase())
+          p.location.toLowerCase().includes(this.searchTerm.toLowerCase()) ||
+          p.customer_name.toLowerCase().includes(this.searchTerm.toLowerCase())
         );
         
         document.getElementById('app').innerHTML = `
@@ -172,10 +230,15 @@
             <button onclick="app.view='inventory'; app.render()" class="flex-1 py-3 ${this.view === 'inventory' ? 'bg-blue-50 text-blue-600 border-b-2 border-blue-600' : 'text-gray-600'}">
               📋 Inventory
             </button>
+            <button onclick="app.view='history'; app.render()" class="flex-1 py-3 ${this.view === 'history' ? 'bg-blue-50 text-blue-600 border-b-2 border-blue-600' : 'text-gray-600'}">
+              📜 History
+            </button>
           </div>
           
           <div class="p-4">
-            ${this.view === 'scan' ? this.renderScan() : this.renderInventory(filtered)}
+            ${this.view === 'scan' ? this.renderScan() : 
+              this.view === 'inventory' ? this.renderInventory(filtered) :
+              this.renderHistory()}
           </div>
         `;
         
@@ -186,40 +249,47 @@
       },
       
       attachSearchListener() {
-  const searchInput = document.getElementById('search-input');
-  if (searchInput) {
-    // Remove old listeners to prevent duplicates
-    const newSearchInput = searchInput.cloneNode(true);
-    searchInput.parentNode.replaceChild(newSearchInput, searchInput);
-    
-    newSearchInput.addEventListener('input', (e) => {
-      this.searchTerm = e.target.value;
-      const filtered = this.pallets.filter(p => 
-        p.product_id.toLowerCase().includes(this.searchTerm.toLowerCase()) ||
-        p.location.toLowerCase().includes(this.searchTerm.toLowerCase())
-      );
-      
-      // Only update the results div, not the search box
-      const resultsDiv = document.querySelector('.space-y-2');
-      if (resultsDiv) {
-        resultsDiv.innerHTML = filtered.length === 0 ? 
-          '<div class="text-center text-gray-500 py-8 text-lg">No pallets found</div>' :
-          filtered.map(p => `
-            <div class="bg-white p-4 rounded-lg shadow flex justify-between items-start">
-              <div class="flex-1">
-                <h3 class="font-bold text-lg">${p.product_id}</h3>
-                <p class="text-gray-600">📍 ${p.location}</p>
-                <p class="text-sm text-gray-500">Qty: ${p.quantity} • ${new Date(p.date_added).toLocaleDateString()}</p>
-              </div>
-              <button onclick="app.checkOut('${p.id}')" class="text-red-500 hover:bg-red-50 p-3 rounded text-xl">
-                ✗
-              </button>
-            </div>
-          `).join('');
-      }
-    });
-  }
-},
+        const searchInput = document.getElementById('search-input');
+        if (searchInput) {
+          // Remove old listeners to prevent duplicates
+          const newSearchInput = searchInput.cloneNode(true);
+          searchInput.parentNode.replaceChild(newSearchInput, searchInput);
+          
+          newSearchInput.addEventListener('input', (e) => {
+            this.searchTerm = e.target.value;
+            const filtered = this.pallets.filter(p => 
+              p.product_id.toLowerCase().includes(this.searchTerm.toLowerCase()) ||
+              p.location.toLowerCase().includes(this.searchTerm.toLowerCase()) ||
+              p.customer_name.toLowerCase().includes(this.searchTerm.toLowerCase())
+            );
+            
+            // Only update the results div, not the search box
+            const resultsDiv = document.querySelector('.space-y-2');
+            if (resultsDiv) {
+              resultsDiv.innerHTML = filtered.length === 0 ? 
+                '<div class="text-center text-gray-500 py-8 text-lg">No pallets found</div>' :
+                filtered.map(p => `
+                  <div class="bg-white p-4 rounded-lg shadow flex justify-between items-start">
+                    <div class="flex-1">
+                      <h3 class="font-bold text-lg">${p.product_id}</h3>
+                      <p class="text-blue-600 font-semibold">👤 ${p.customer_name}</p>
+                      <p class="text-gray-600">📍 ${p.location}</p>
+                      <p class="text-sm text-gray-500">Qty: ${p.quantity} • ${new Date(p.date_added).toLocaleDateString()}</p>
+                    </div>
+                    <div class="flex flex-col gap-2">
+                      <button onclick="app.removePartialQuantity('${p.id}')" class="bg-orange-500 text-white px-3 py-2 rounded text-sm hover:bg-orange-600">
+                        Remove Qty
+                      </button>
+                      <button onclick="app.checkOut('${p.id}')" class="bg-red-500 text-white px-3 py-2 rounded text-sm hover:bg-red-600">
+                        Remove All
+                      </button>
+                    </div>
+                  </div>
+                `).join('');
+            }
+          });
+        }
+      },
       
       renderScan() {
         if (!this.scanMode) {
@@ -264,7 +334,7 @@
             <input 
               id="search-input"
               type="text" 
-              placeholder="Search product or location..." 
+              placeholder="Search customer, product or location..." 
               value="${this.searchTerm}"
               class="flex-1 border p-3 rounded text-lg"
             />
@@ -280,12 +350,86 @@
                 <div class="bg-white p-4 rounded-lg shadow flex justify-between items-start">
                   <div class="flex-1">
                     <h3 class="font-bold text-lg">${p.product_id}</h3>
+                    <p class="text-blue-600 font-semibold">👤 ${p.customer_name}</p>
                     <p class="text-gray-600">📍 ${p.location}</p>
-                    <p class="text-sm text-gray-500">Qty: ${p.quantity} • ${new Date(p.date_added).toLocaleDateString()}</p>
+                    <p class="text-sm text-gray-500">Qty: ${p.quantity} • Added: ${new Date(p.date_added).toLocaleDateString()}</p>
                   </div>
-                  <button onclick="app.checkOut('${p.id}')" class="text-red-500 hover:bg-red-50 p-3 rounded text-xl">
-                    ✗
-                  </button>
+                  <div class="flex flex-col gap-2">
+                    <button onclick="app.removePartialQuantity('${p.id}')" class="bg-orange-500 text-white px-3 py-2 rounded text-sm hover:bg-orange-600">
+                      Remove Qty
+                    </button>
+                    <button onclick="app.checkOut('${p.id}')" class="bg-red-500 text-white px-3 py-2 rounded text-sm hover:bg-red-600">
+                      Remove All
+                    </button>
+                  </div>
+                </div>
+              `).join('')
+            }
+          </div>
+        `;
+      },
+      
+      renderHistory() {
+        const getActionBadge = (action) => {
+          if (action === 'CHECK_IN') return '<span class="bg-green-100 text-green-800 px-2 py-1 rounded text-xs font-semibold">✓ Check In</span>';
+          if (action === 'CHECK_OUT') return '<span class="bg-red-100 text-red-800 px-2 py-1 rounded text-xs font-semibold">✗ Check Out</span>';
+          if (action === 'PARTIAL_REMOVE') return '<span class="bg-orange-100 text-orange-800 px-2 py-1 rounded text-xs font-semibold">↓ Partial Remove</span>';
+          return action;
+        };
+        
+        return `
+          <div class="mb-4">
+            <h2 class="text-xl font-bold text-gray-800">Activity History</h2>
+            <p class="text-sm text-gray-600">Last 100 activities</p>
+          </div>
+          
+          <div class="space-y-2">
+            ${this.activityLog.length === 0 ? 
+              '<div class="text-center text-gray-500 py-8 text-lg">No activity yet</div>' :
+              this.activityLog.map(a => `
+                <div class="bg-white p-4 rounded-lg shadow">
+                  <div class="flex justify-between items-start mb-2">
+                    <div class="flex-1">
+                      <h3 class="font-bold text-lg">${a.product_id}</h3>
+                      <p class="text-blue-600 font-semibold text-sm">👤 ${a.customer_name}</p>
+                    </div>
+                    ${getActionBadge(a.action)}
+                  </div>
+                  
+                  <div class="grid grid-cols-2 gap-2 text-sm mt-2">
+                    <div>
+                      <span class="text-gray-600">Location:</span>
+                      <span class="font-semibold ml-1">${a.location}</span>
+                    </div>
+                    ${a.action === 'PARTIAL_REMOVE' || a.action === 'CHECK_OUT' ? `
+                      <div>
+                        <span class="text-gray-600">Removed:</span>
+                        <span class="font-semibold ml-1 text-red-600">${a.quantity_changed}</span>
+                      </div>
+                    ` : ''}
+                    ${a.action === 'PARTIAL_REMOVE' ? `
+                      <div>
+                        <span class="text-gray-600">Before:</span>
+                        <span class="font-semibold ml-1">${a.quantity_before}</span>
+                      </div>
+                      <div>
+                        <span class="text-gray-600">After:</span>
+                        <span class="font-semibold ml-1">${a.quantity_after}</span>
+                      </div>
+                    ` : ''}
+                    ${a.action === 'CHECK_IN' ? `
+                      <div>
+                        <span class="text-gray-600">Quantity:</span>
+                        <span class="font-semibold ml-1 text-green-600">${a.quantity_after}</span>
+                      </div>
+                    ` : ''}
+                  </div>
+                  
+                  ${a.notes ? `<p class="text-xs text-gray-500 mt-2 italic">${a.notes}</p>` : ''}
+                  
+                  <p class="text-xs text-gray-400 mt-2">
+                    📅 ${new Date(a.timestamp).toLocaleString()}
+                  </p>
                 </div>
               `).join('')
             }
