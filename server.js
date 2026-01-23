@@ -160,6 +160,128 @@ app.get('/api/export', (req, res) => {
   });
 });
 
+// API Routes
+
+// Get all active pallets
+app.get('/api/pallets', (req, res) => {
+  db.all('SELECT * FROM pallets WHERE status = "active" ORDER BY date_added DESC', (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(rows);
+  });
+});
+
+// Search pallets
+app.get('/api/pallets/search', (req, res) => {
+  const { q } = req.query;
+  db.all(
+    'SELECT * FROM pallets WHERE status = "active" AND (product_id LIKE ? OR location LIKE ?) ORDER BY date_added DESC',
+    [`%${q}%`, `%${q}%`],
+    (err, rows) => {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json(rows);
+    }
+  );
+});
+
+// Check in a pallet
+app.post('/api/pallets', (req, res) => {
+  const { id, product_id, quantity, location } = req.body;
+  
+  if (!product_id || !location) {
+    return res.status(400).json({ error: 'Product ID and location required' });
+  }
+
+  const palletId = id || `PLT-${Date.now()}`;
+
+  db.run(
+    'INSERT INTO pallets (id, product_id, quantity, location) VALUES (?, ?, ?, ?)',
+    [palletId, product_id, quantity || 1, location],
+    function(err) {
+      if (err) return res.status(500).json({ error: err.message });
+      
+      db.run('UPDATE locations SET is_occupied = 1 WHERE id = ?', [location]);
+      
+      res.json({ 
+        id: palletId, 
+        product_id, 
+        quantity: quantity || 1, 
+        location,
+        message: 'Pallet checked in successfully'
+      });
+    }
+  );
+});
+
+// Check out a pallet
+app.delete('/api/pallets/:id', (req, res) => {
+  const { id } = req.params;
+  
+  db.get('SELECT location FROM pallets WHERE id = ? OR product_id = ?', [id, id], (err, row) => {
+    if (err) return res.status(500).json({ error: err.message });
+    if (!row) return res.status(404).json({ error: 'Pallet not found' });
+
+    db.run(
+      'UPDATE pallets SET status = "removed", date_removed = CURRENT_TIMESTAMP WHERE id = ? OR product_id = ?',
+      [id, id],
+      (err) => {
+        if (err) return res.status(500).json({ error: err.message });
+        
+        db.run('UPDATE locations SET is_occupied = 0 WHERE id = ?', [row.location]);
+        
+        res.json({ message: 'Pallet checked out successfully' });
+      }
+    );
+  });
+});
+
+// Get all locations
+app.get('/api/locations', (req, res) => {
+  db.all('SELECT * FROM locations ORDER BY aisle, rack, level', (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(rows);
+  });
+});
+
+// Get stats
+app.get('/api/stats', (req, res) => {
+  db.get(
+    `SELECT 
+      COUNT(*) as total_pallets,
+      (SELECT COUNT(*) FROM locations WHERE is_occupied = 1) as occupied_locations,
+      (SELECT COUNT(*) FROM locations) as total_locations
+    FROM pallets WHERE status = "active"`,
+    (err, row) => {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json(row);
+    }
+  );
+});
+
+// Export to CSV
+app.get('/api/export', (req, res) => {
+  db.all('SELECT * FROM pallets WHERE status = "active"', (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    
+    const csv = ['Product ID,Quantity,Location,Date Added']
+      .concat(rows.map(p => 
+        `${p.product_id},${p.quantity},${p.location},${p.date_added}`
+      ))
+      .join('\n');
+    
+    res.header('Content-Type', 'text/csv');
+    res.attachment('inventory.csv');
+    res.send(csv);
+  });
+});
+
+// Start server
+app.listen(PORT, '0.0.0.0', () => {
+  console.log('\n🚀 Warehouse Server Running!');
+  console.log(`\n📱 Access from devices on network:`);
+  console.log(`   Local: http://localhost:${PORT}`);
+  console.log('\n   Find your IP with: ifconfig | grep "inet "');
+  console.log('   Then access at: http://YOUR_IP:3000\n');
+});
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🚀 Warehouse Server Running!`);
   console.log(`\n📱 Access from devices on network:`);
