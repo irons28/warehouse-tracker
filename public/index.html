@@ -1,16 +1,16 @@
 <!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <tile>Warehouse Tracker</tile>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://unpkg.com/html5-qrcode"></script>
-  </head>
-  <body class="bg-gray-100">
-    <div id="app"></div>
-
-     <script>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Warehouse Tracker</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/html5-qrcode"></script>
+</head>
+<body class="bg-gray-100">
+  <div id="app"></div>
+  
+  <script>
     const API_URL = window.location.origin;
     
     const app = {
@@ -178,7 +178,48 @@
             ${this.view === 'scan' ? this.renderScan() : this.renderInventory(filtered)}
           </div>
         `;
+        
+        // Attach search listener after rendering inventory
+        if (this.view === 'inventory') {
+          this.attachSearchListener();
+        }
       },
+      
+      attachSearchListener() {
+  const searchInput = document.getElementById('search-input');
+  if (searchInput) {
+    // Remove old listeners to prevent duplicates
+    const newSearchInput = searchInput.cloneNode(true);
+    searchInput.parentNode.replaceChild(newSearchInput, searchInput);
+    
+    newSearchInput.addEventListener('input', (e) => {
+      this.searchTerm = e.target.value;
+      const filtered = this.pallets.filter(p => 
+        p.product_id.toLowerCase().includes(this.searchTerm.toLowerCase()) ||
+        p.location.toLowerCase().includes(this.searchTerm.toLowerCase())
+      );
+      
+      // Only update the results div, not the search box
+      const resultsDiv = document.querySelector('.space-y-2');
+      if (resultsDiv) {
+        resultsDiv.innerHTML = filtered.length === 0 ? 
+          '<div class="text-center text-gray-500 py-8 text-lg">No pallets found</div>' :
+          filtered.map(p => `
+            <div class="bg-white p-4 rounded-lg shadow flex justify-between items-start">
+              <div class="flex-1">
+                <h3 class="font-bold text-lg">${p.product_id}</h3>
+                <p class="text-gray-600">📍 ${p.location}</p>
+                <p class="text-sm text-gray-500">Qty: ${p.quantity} • ${new Date(p.date_added).toLocaleDateString()}</p>
+              </div>
+              <button onclick="app.checkOut('${p.id}')" class="text-red-500 hover:bg-red-50 p-3 rounded text-xl">
+                ✗
+              </button>
+            </div>
+          `).join('');
+      }
+    });
+  }
+},
       
       renderScan() {
         if (!this.scanMode) {
@@ -221,10 +262,10 @@
         return `
           <div class="mb-4 flex gap-2">
             <input 
+              id="search-input"
               type="text" 
               placeholder="Search product or location..." 
               value="${this.searchTerm}"
-              oninput="app.searchTerm = this.value; app.render()"
               class="flex-1 border p-3 rounded text-lg"
             />
             <a href="${API_URL}/api/export" download class="bg-blue-500 text-white px-4 py-3 rounded flex items-center">
@@ -255,5 +296,5 @@
     
     app.init();
   </script>
-  </body>
+</body>
 </html>
