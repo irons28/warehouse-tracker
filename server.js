@@ -3,9 +3,13 @@ const cors = require("cors");
 const sqlite3 = require("sqlite3").verbose();
 const bodyParser = require("body-parser");
 const path = require("path");
+const https = require("https");
+const http = require("http");
+const fs = require("fs");
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
+const HTTPS_PORT = process.env.HTTPS_PORT || 3443;
 
 // Middleware
 app.use(cors());
@@ -436,11 +440,67 @@ app.get("/api/customers", (req, res) => {
   );
 });
 
-// Start server
-app.listen(PORT, "0.0.0.0", () => {
+// Get network interfaces to display IP addresses
+function getLocalIPs() {
+  const { networkInterfaces } = require('os');
+  const nets = networkInterfaces();
+  const results = [];
+
+  for (const name of Object.keys(nets)) {
+    for (const net of nets[name]) {
+      // Skip internal (loopback) and non-IPv4 addresses
+      if (net.family === 'IPv4' && !net.internal) {
+        results.push(net.address);
+      }
+    }
+  }
+  
+  return results;
+}
+
+// Check if SSL certificates exist
+const sslKeyPath = path.join(__dirname, 'ssl', 'key.pem');
+const sslCertPath = path.join(__dirname, 'ssl', 'cert.pem');
+const hasSSL = fs.existsSync(sslKeyPath) && fs.existsSync(sslCertPath);
+
+// Start HTTP server
+http.createServer(app).listen(PORT, "0.0.0.0", () => {
   console.log("\n🚀 Warehouse Server Running!");
   console.log(`\n📱 Access from devices on network:`);
   console.log(`   Local: http://localhost:${PORT}`);
-  console.log('\n   Find your IP with: ifconfig | grep "inet "');
-  console.log("   Then access at: http://YOUR_IP:3000\n");
+
+  const ips = getLocalIPs();
+  ips.forEach((ip) => {
+    console.log(`   Network: http://${ip}:${PORT}`);
+  });
+
+  if (!hasSSL) {
+    console.log("\n⚠️  HTTPS not enabled - camera features require HTTPS!");
+    console.log("   To enable HTTPS, run: npm run generate-ssl");
+  }
+  console.log("");
 });
+
+// Start HTTPS server if certificates exist
+if (hasSSL) {
+  const httpsOptions = {
+    key: fs.readFileSync(sslKeyPath),
+    cert: fs.readFileSync(sslCertPath),
+  };
+
+  https.createServer(httpsOptions, app).listen(HTTPS_PORT, "0.0.0.0", () => {
+    console.log("\n🔒 HTTPS Server Running!");
+    console.log(`\n📱 Secure access (for camera features):`);
+    console.log(`   Local: https://localhost:${HTTPS_PORT}`);
+
+    const ips = getLocalIPs();
+    ips.forEach((ip) => {
+      console.log(`   Network: https://${ip}:${HTTPS_PORT}`);
+    });
+
+    console.log("\n✅ Camera scanning will work on mobile devices!");
+    console.log(
+      "   (You may need to accept the self-signed certificate warning)\n",
+    );
+  });
+}

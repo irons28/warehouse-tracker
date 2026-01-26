@@ -6,6 +6,7 @@
   <title>Warehouse Tracker</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/html5-qrcode"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 </head>
 <body class="bg-gray-100">
   <div id="app"></div>
@@ -16,6 +17,7 @@
     const app = {
       view: 'scan',
       pallets: [],
+      locations: [],
       stats: {},
       activityLog: [],
       scanMode: null,
@@ -26,6 +28,7 @@
       async init() {
         await this.loadStats();
         await this.loadPallets();
+        await this.loadLocations();
         await this.loadActivity();
         this.render();
       },
@@ -36,6 +39,15 @@
           this.pallets = await res.json();
         } catch (e) {
           console.error('Error loading pallets:', e);
+        }
+      },
+      
+      async loadLocations() {
+        try {
+          const res = await fetch(`${API_URL}/api/locations`);
+          this.locations = await res.json();
+        } catch (e) {
+          console.error('Error loading locations:', e);
         }
       },
       
@@ -139,17 +151,45 @@
           const html5QrCode = new Html5Qrcode("qr-reader");
           this.scanner = html5QrCode;
           
-          html5QrCode.start(
-            { facingMode: "environment" },
-            { fps: 10, qrbox: 250 },
-            (decodedText) => {
-              this.handleScan(decodedText);
-              html5QrCode.stop();
+          // Request camera permissions first
+          Html5Qrcode.getCameras().then(cameras => {
+            if (cameras && cameras.length > 0) {
+              // Use back camera if available (better for scanning)
+              const cameraId = cameras.length > 1 ? cameras[1].id : cameras[0].id;
+              
+              html5QrCode.start(
+                cameraId,
+                {
+                  fps: 10,
+                  qrbox: { width: 250, height: 250 },
+                  aspectRatio: 1.0
+                },
+                (decodedText) => {
+                  this.handleScan(decodedText);
+                  html5QrCode.stop().catch(err => console.log('Stop error:', err));
+                },
+                (errorMessage) => {
+                  // Scanning errors are normal, ignore them
+                }
+              ).catch(err => {
+                console.error("Camera start error:", err);
+                alert("Camera access denied or not available. Please enable camera permissions in your browser settings, then try again.");
+                this.stopScanner();
+                this.scanMode = null;
+                this.render();
+              });
+            } else {
+              alert("No cameras found on this device. Please use manual entry.");
+              this.stopScanner();
+              this.scanMode = null;
+              this.render();
             }
-          ).catch(err => {
-            console.error("Camera error:", err);
-            alert("Camera not available. Use manual entry.");
+          }).catch(err => {
+            console.error("Camera detection error:", err);
+            alert("Unable to access camera. Please ensure:\n1. You're using HTTPS (or localhost)\n2. Camera permissions are enabled\n3. No other app is using the camera\n\nUse manual entry instead.");
             this.stopScanner();
+            this.scanMode = null;
+            this.render();
           });
         }, 100);
       },
@@ -160,13 +200,17 @@
           this.stopScanner();
           setTimeout(() => {
             this.scanMode = 'checkin-location';
-            this.render();
             this.startScanner('checkin-location');
           }, 500);
         } else if (this.scanMode === 'checkin-location') {
           this.stopScanner();
           const customerName = prompt('Enter Customer Name:');
-          if (!customerName) return;
+          if (!customerName) {
+            this.scanMode = null;
+            this.tempPallet = null;
+            this.render();
+            return;
+          }
           const qty = prompt('Enter quantity:', '1');
           if (qty !== null) {
             this.checkIn(customerName, this.tempPallet, parseInt(qty) || 1, code);
@@ -183,7 +227,11 @@
       stopScanner() {
         if (this.scanner) {
           try {
-            this.scanner.stop();
+            this.scanner.stop().then(() => {
+              this.scanner.clear();
+            }).catch(e => {
+              console.log('Scanner stop error:', e);
+            });
           } catch (e) {
             console.log('Scanner already stopped');
           }
@@ -206,6 +254,90 @@
         }
       },
       
+      async generateQRCode(text, containerId) {
+        return new Promise((resolve) => {
+          setTimeout(() => {
+            const container = document.getElementById(containerId);
+            if (container) {
+              // Clear any existing QR code
+              container.innerHTML = '';
+              
+              try {
+                // Use QRCode.js library (different from canvas-based)
+                new QRCode(container, {
+                  text: text,
+                  width: 200,
+                  height: 200,
+                  colorDark: "#000000",
+                  colorLight: "#ffffff",
+                  correctLevel: QRCode.CorrectLevel.H
+                });
+                resolve();
+              } catch (error) {
+                console.error('QR Code generation error:', error);
+                resolve();
+              }
+            } else {
+              console.error('Container not found:', containerId);
+              resolve();
+            }
+          }, 100);
+        });
+      },
+      
+      async showQRGenerator() {
+        this.view = 'qr-generator';
+        this.render();
+      },
+      
+      async generateLocationQRs() {
+        this.view = 'location-qrs';
+        this.render();
+        
+        // Generate QR codes after render
+        setTimeout(async () => {
+          const aisles = this.locations.reduce((acc, loc) => {
+            if (!acc.includes(loc.aisle)) acc.push(loc.aisle);
+            return acc;
+          }, []).sort();
+          
+          for (const aisle of aisles) {
+            const aisleLocations = this.locations.filter(l => l.aisle === aisle);
+            for (const loc of aisleLocations) {
+              await this.generateQRCode(loc.id, `qr-${loc.id}`);
+            }
+          }
+        }, 200);
+      },
+      
+      async generatePalletQR() {
+        const palletId = prompt('Enter Pallet ID (or leave blank for auto-generated):');
+        const finalId = palletId || `PLT-${Date.now()}`;
+        
+        const customerName = prompt('Enter Customer Name:');
+        if (!customerName) return;
+        
+        const productDesc = prompt('Enter Product Description (optional):', '');
+        const quantity = prompt('Enter Quantity:', '1');
+        
+        this.view = 'single-qr';
+        this.tempPallet = {
+          id: finalId,
+          customer: customerName,
+          product: productDesc,
+          quantity: parseInt(quantity) || 1
+        };
+        this.render();
+        
+        setTimeout(async () => {
+          await this.generateQRCode(finalId, 'single-qr-canvas');
+        }, 100);
+      },
+      
+      printQRCodes() {
+        window.print();
+      },
+      
       render() {
         const filtered = this.pallets.filter(p => 
           p.product_id.toLowerCase().includes(this.searchTerm.toLowerCase()) ||
@@ -214,7 +346,7 @@
         );
         
         document.getElementById('app').innerHTML = `
-          <div class="bg-blue-600 text-white p-4 shadow-lg">
+          <div class="bg-blue-600 text-white p-4 shadow-lg print:hidden">
             <h1 class="text-2xl font-bold">Warehouse Tracker</h1>
             <div class="mt-2 text-sm">
               <span class="mr-4">📦 ${this.stats.total_pallets || 0} Pallets</span>
@@ -223,12 +355,15 @@
             </div>
           </div>
           
-          <div class="bg-white border-b sticky top-0 z-10 flex">
+          <div class="bg-white border-b sticky top-0 z-10 flex print:hidden">
             <button onclick="app.view='scan'; app.render()" class="flex-1 py-3 ${this.view === 'scan' ? 'bg-blue-50 text-blue-600 border-b-2 border-blue-600' : 'text-gray-600'}">
               📷 Scan
             </button>
             <button onclick="app.view='inventory'; app.render()" class="flex-1 py-3 ${this.view === 'inventory' ? 'bg-blue-50 text-blue-600 border-b-2 border-blue-600' : 'text-gray-600'}">
               📋 Inventory
+            </button>
+            <button onclick="app.view='qr-generator'; app.render()" class="flex-1 py-3 ${this.view === 'qr-generator' ? 'bg-blue-50 text-blue-600 border-b-2 border-blue-600' : 'text-gray-600'}">
+              🏷️ QR Codes
             </button>
             <button onclick="app.view='history'; app.render()" class="flex-1 py-3 ${this.view === 'history' ? 'bg-blue-50 text-blue-600 border-b-2 border-blue-600' : 'text-gray-600'}">
               📜 History
@@ -238,11 +373,13 @@
           <div class="p-4">
             ${this.view === 'scan' ? this.renderScan() : 
               this.view === 'inventory' ? this.renderInventory(filtered) :
+              this.view === 'qr-generator' ? this.renderQRGenerator() :
+              this.view === 'location-qrs' ? this.renderLocationQRs() :
+              this.view === 'single-qr' ? this.renderSingleQR() :
               this.renderHistory()}
           </div>
         `;
         
-        // Attach search listener after rendering inventory
         if (this.view === 'inventory') {
           this.attachSearchListener();
         }
@@ -251,7 +388,6 @@
       attachSearchListener() {
         const searchInput = document.getElementById('search-input');
         if (searchInput) {
-          // Remove old listeners to prevent duplicates
           const newSearchInput = searchInput.cloneNode(true);
           searchInput.parentNode.replaceChild(newSearchInput, searchInput);
           
@@ -263,7 +399,6 @@
               p.customer_name.toLowerCase().includes(this.searchTerm.toLowerCase())
             );
             
-            // Only update the results div, not the search box
             const resultsDiv = document.querySelector('.space-y-2');
             if (resultsDiv) {
               resultsDiv.innerHTML = filtered.length === 0 ? 
@@ -326,6 +461,155 @@
             </div>
           `;
         }
+      },
+      
+      renderQRGenerator() {
+        return `
+          <div class="space-y-4">
+            <div class="bg-white p-6 rounded-lg shadow">
+              <h2 class="text-xl font-bold mb-4">QR Code Generator</h2>
+              <p class="text-gray-600 mb-6">Generate QR codes for scanning pallets and locations</p>
+              
+              <div class="space-y-3">
+                <button onclick="app.generatePalletQR()" class="w-full bg-blue-500 text-white p-4 rounded-lg shadow hover:bg-blue-600 text-lg">
+                  🏷️ Generate Pallet QR Code
+                </button>
+                
+                <button onclick="app.generateLocationQRs()" class="w-full bg-purple-500 text-white p-4 rounded-lg shadow hover:bg-purple-600 text-lg">
+                  📍 Generate All Location QR Codes
+                </button>
+              </div>
+            </div>
+            
+            <div class="bg-yellow-50 border-l-4 border-yellow-400 p-4">
+              <p class="text-sm text-yellow-800">
+                <strong>Tip:</strong> After generating QR codes, use your browser's print function to print labels. 
+                Location QR codes are organized by aisle for easy labeling.
+              </p>
+            </div>
+          </div>
+        `;
+      },
+      
+      renderSingleQR() {
+        const pallet = this.tempPallet;
+        return `
+          <div class="max-w-md mx-auto">
+            <div id="print-label" class="bg-white p-6 rounded-lg shadow text-center border-2 border-gray-300">
+              <h2 class="text-xl font-bold mb-2 print:text-2xl">Pallet Label</h2>
+              
+              <div class="bg-gray-50 p-4 rounded-lg inline-block mb-4">
+                <div id="single-qr-canvas"></div>
+              </div>
+              
+              <div class="border-t-2 border-gray-300 pt-4 text-left">
+                <div class="mb-2">
+                  <span class="text-gray-600 text-sm">Pallet ID:</span>
+                  <p class="font-mono text-lg font-bold">${pallet.id}</p>
+                </div>
+                
+                <div class="mb-2">
+                  <span class="text-gray-600 text-sm">Customer:</span>
+                  <p class="font-semibold text-lg">${pallet.customer}</p>
+                </div>
+                
+                ${pallet.product ? `
+                  <div class="mb-2">
+                    <span class="text-gray-600 text-sm">Product:</span>
+                    <p class="font-medium">${pallet.product}</p>
+                  </div>
+                ` : ''}
+                
+                <div class="mb-2">
+                  <span class="text-gray-600 text-sm">Quantity:</span>
+                  <p class="font-bold text-xl text-blue-600">${pallet.quantity}</p>
+                </div>
+                
+                <div class="text-xs text-gray-500 mt-4">
+                  Generated: ${new Date().toLocaleString()}
+                </div>
+              </div>
+            </div>
+            
+            <div class="mt-6 space-y-2 print:hidden">
+              <button onclick="app.printQRCodes()" class="w-full bg-blue-500 text-white p-3 rounded-lg hover:bg-blue-600">
+                🖨️ Print Label
+              </button>
+              <button onclick="app.generatePalletQR()" class="w-full bg-gray-500 text-white p-3 rounded-lg hover:bg-gray-600">
+                Generate Another
+              </button>
+              <button onclick="app.view='qr-generator'; app.render()" class="w-full bg-gray-300 text-gray-700 p-3 rounded-lg hover:bg-gray-400">
+                Back
+              </button>
+            </div>
+          </div>
+          
+          <style>
+            @media print {
+              body * { visibility: hidden; }
+              #print-label, #print-label * { visibility: visible; }
+              #print-label { 
+                position: absolute; 
+                left: 50%; 
+                top: 50%; 
+                transform: translate(-50%, -50%);
+                border: 2px solid #000;
+                padding: 20px;
+              }
+            }
+          </style>
+        `;
+      },
+      
+      renderLocationQRs() {
+        const aisles = this.locations.reduce((acc, loc) => {
+          if (!acc.includes(loc.aisle)) acc.push(loc.aisle);
+          return acc;
+        }, []).sort();
+        
+        return `
+          <div class="print:p-0">
+            <div class="mb-4 print:hidden">
+              <button onclick="app.printQRCodes()" class="bg-blue-500 text-white px-6 py-3 rounded-lg hover:bg-blue-600 mr-2">
+                🖨️ Print All QR Codes
+              </button>
+              <button onclick="app.view='qr-generator'; app.render()" class="bg-gray-500 text-white px-6 py-3 rounded-lg hover:bg-gray-600">
+                Back
+              </button>
+            </div>
+            
+            ${aisles.map(aisle => {
+              const aisleLocations = this.locations.filter(l => l.aisle === aisle);
+              return `
+                <div class="mb-8 print:break-after-page">
+                  <h2 class="text-2xl font-bold mb-4 print:text-3xl">Aisle ${aisle}</h2>
+                  <div class="grid grid-cols-4 gap-4 print:grid-cols-6 print:gap-2">
+                    ${aisleLocations.map(loc => `
+                      <div class="bg-white p-3 rounded-lg shadow text-center print:border print:border-gray-300">
+                        <div id="qr-${loc.id}" class="mx-auto flex items-center justify-center" style="min-height: 120px;"></div>
+                        <p class="mt-2 font-mono text-sm font-semibold print:text-xs">${loc.id}</p>
+                      </div>
+                    `).join('')}
+                  </div>
+                </div>
+              `;
+            }).join('')}
+          </div>
+          
+          <style>
+            @media print {
+              .print\\:hidden { display: none !important; }
+              .print\\:break-after-page { page-break-after: always; }
+              body { background: white; }
+              .print\\:p-0 { padding: 0; }
+              .print\\:border { border: 1px solid #d1d5db; }
+              .print\\:grid-cols-6 { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+              .print\\:gap-2 { gap: 0.5rem; }
+              .print\\:text-3xl { font-size: 1.875rem; }
+              .print\\:text-xs { font-size: 0.75rem; }
+            }
+          </style>
+        `;
       },
       
       renderInventory(pallets) {
