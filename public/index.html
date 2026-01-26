@@ -7,9 +7,202 @@
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/html5-qrcode"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+  <style>
+    /* Smooth transitions */
+    * {
+      transition: all 0.2s ease-in-out;
+    }
+    
+    /* Loading spinner */
+    .spinner {
+      border: 3px solid #f3f4f6;
+      border-top: 3px solid #3b82f6;
+      border-radius: 50%;
+      width: 40px;
+      height: 40px;
+      animation: spin 1s linear infinite;
+    }
+    
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+    
+    /* Toast notifications */
+    .toast {
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      min-width: 300px;
+      max-width: 500px;
+      padding: 16px 20px;
+      border-radius: 8px;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+      z-index: 9999;
+      animation: slideIn 0.3s ease-out;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    
+    .toast.success {
+      background: #10b981;
+      color: white;
+    }
+    
+    .toast.error {
+      background: #ef4444;
+      color: white;
+    }
+    
+    .toast.info {
+      background: #3b82f6;
+      color: white;
+    }
+    
+    @keyframes slideIn {
+      from {
+        transform: translateX(400px);
+        opacity: 0;
+      }
+      to {
+        transform: translateX(0);
+        opacity: 1;
+      }
+    }
+    
+    @keyframes slideOut {
+      from {
+        transform: translateX(0);
+        opacity: 1;
+      }
+      to {
+        transform: translateX(400px);
+        opacity: 0;
+      }
+    }
+    
+    .toast.hiding {
+      animation: slideOut 0.3s ease-out;
+    }
+    
+    /* Modal backdrop */
+    .modal-backdrop {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: rgba(0,0,0,0.5);
+      z-index: 9998;
+      animation: fadeIn 0.2s ease-out;
+    }
+    
+    @keyframes fadeIn {
+      from { opacity: 0; }
+      to { opacity: 1; }
+    }
+    
+    /* Modal */
+    .modal {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      z-index: 9999;
+      background: white;
+      border-radius: 12px;
+      box-shadow: 0 20px 50px rgba(0,0,0,0.3);
+      max-width: 90%;
+      animation: modalSlideIn 0.3s ease-out;
+    }
+    
+    @keyframes modalSlideIn {
+      from {
+        opacity: 0;
+        transform: translate(-50%, -45%);
+      }
+      to {
+        opacity: 1;
+        transform: translate(-50%, -50%);
+      }
+    }
+    
+    /* Card hover effects */
+    .card-hover {
+      transition: transform 0.2s, box-shadow 0.2s;
+    }
+    
+    .card-hover:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 20px rgba(0,0,0,0.15);
+    }
+    
+    /* Button press effect */
+    button:active {
+      transform: scale(0.97);
+    }
+    
+    /* Skeleton loader */
+    .skeleton {
+      background: linear-gradient(90deg, #f3f4f6 25%, #e5e7eb 50%, #f3f4f6 75%);
+      background-size: 200% 100%;
+      animation: shimmer 1.5s infinite;
+    }
+    
+    @keyframes shimmer {
+      0% { background-position: 200% 0; }
+      100% { background-position: -200% 0; }
+    }
+    
+    /* Fade in animation */
+    .fade-in {
+      animation: fadeInUp 0.4s ease-out;
+    }
+    
+    @keyframes fadeInUp {
+      from {
+        opacity: 0;
+        transform: translateY(20px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+    
+    /* Mobile improvements */
+    @media (max-width: 640px) {
+      .toast {
+        left: 10px;
+        right: 10px;
+        min-width: auto;
+      }
+      
+      .modal {
+        max-width: 95%;
+        width: 95%;
+      }
+    }
+    
+    /* Print styles */
+    @media print {
+      .print\\:hidden { display: none !important; }
+      .print\\:break-after-page { page-break-after: always; }
+      body { background: white; }
+      .print\\:p-0 { padding: 0; }
+      .print\\:border { border: 1px solid #d1d5db; }
+      .print\\:grid-cols-6 { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+      .print\\:gap-2 { gap: 0.5rem; }
+      .print\\:text-3xl { font-size: 1.875rem; }
+      .print\\:text-xs { font-size: 0.75rem; }
+    }
+  </style>
 </head>
 <body class="bg-gray-100">
   <div id="app"></div>
+  <div id="toast-container"></div>
+  <div id="modal-container"></div>
   
   <script>
     const API_URL = window.location.origin;
@@ -20,25 +213,234 @@
       locations: [],
       stats: {},
       activityLog: [],
+      customers: [],
+      selectedCustomer: '',
       scanMode: null,
       tempPallet: null,
       searchTerm: '',
       scanner: null,
+      loading: false,
+      
+      // Toast notification system
+      showToast(message, type = 'info') {
+        const container = document.getElementById('toast-container');
+        const toast = document.createElement('div');
+        toast.className = `toast ${type}`;
+        
+        const icon = type === 'success' ? '✓' : type === 'error' ? '✗' : 'ℹ';
+        toast.innerHTML = `
+          <div style="font-size: 24px;">${icon}</div>
+          <div style="flex: 1;">${message}</div>
+        `;
+        
+        container.appendChild(toast);
+        
+        setTimeout(() => {
+          toast.classList.add('hiding');
+          setTimeout(() => toast.remove(), 300);
+        }, 3000);
+      },
+      
+      // Modal system
+      showModal(title, content, buttons = []) {
+        return new Promise((resolve) => {
+          const container = document.getElementById('modal-container');
+          
+          const backdrop = document.createElement('div');
+          backdrop.className = 'modal-backdrop';
+          
+          const modal = document.createElement('div');
+          modal.className = 'modal';
+          modal.innerHTML = `
+            <div class="p-6">
+              <h3 class="text-xl font-bold mb-4">${title}</h3>
+              <div class="mb-6">${content}</div>
+              <div class="flex gap-2 justify-end">
+                ${buttons.map((btn, i) => `
+                  <button 
+                    onclick="app.closeModal(${i})" 
+                    class="px-4 py-2 rounded-lg font-semibold ${btn.primary ? 'bg-blue-600 text-white hover:bg-blue-700' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'}"
+                  >
+                    ${btn.text}
+                  </button>
+                `).join('')}
+              </div>
+            </div>
+          `;
+          
+          container.appendChild(backdrop);
+          container.appendChild(modal);
+          
+          window.modalResolve = resolve;
+          window.modalButtons = buttons;
+        });
+      },
+      
+      closeModal(buttonIndex) {
+        const container = document.getElementById('modal-container');
+        const input = container.querySelector('input');
+        const inputValue = input ? input.value : null;
+        
+        container.innerHTML = '';
+        
+        if (window.modalResolve) {
+          const buttonValue = window.modalButtons[buttonIndex].value;
+          // If it's a prompt dialog (has OK button), return the input value
+          if (buttonValue === 'ok' && inputValue !== null) {
+            window.modalResolve(inputValue);
+          } else {
+            window.modalResolve(buttonValue);
+          }
+        }
+      },
+      
+      // Confirmation dialog
+      async confirm(title, message) {
+        const result = await this.showModal(
+          title,
+          `<p class="text-gray-700">${message}</p>`,
+          [
+            { text: 'Cancel', value: false },
+            { text: 'Confirm', value: true, primary: true }
+          ]
+        );
+        return result;
+      },
+      
+      // Prompt dialog
+      async prompt(title, message, defaultValue = '') {
+        const inputId = 'modal-input-' + Date.now();
+        
+        return new Promise((resolve) => {
+          const container = document.getElementById('modal-container');
+          
+          const backdrop = document.createElement('div');
+          backdrop.className = 'modal-backdrop';
+          
+          const modal = document.createElement('div');
+          modal.className = 'modal';
+          modal.innerHTML = `
+            <div class="p-6">
+              <h3 class="text-xl font-bold mb-4">${title}</h3>
+              <div class="mb-6">
+                <p class="text-gray-700 mb-3">${message}</p>
+                <input 
+                  id="${inputId}" 
+                  type="text" 
+                  value="${defaultValue}" 
+                  class="w-full border border-gray-300 rounded-lg px-4 py-2 text-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                  autofocus
+                />
+              </div>
+              <div class="flex gap-2 justify-end">
+                <button 
+                  onclick="app.closePrompt('${inputId}', null)" 
+                  class="px-4 py-2 rounded-lg font-semibold bg-gray-200 text-gray-700 hover:bg-gray-300"
+                >
+                  Cancel
+                </button>
+                <button 
+                  onclick="app.closePrompt('${inputId}', 'ok')" 
+                  class="px-4 py-2 rounded-lg font-semibold bg-blue-600 text-white hover:bg-blue-700"
+                >
+                  OK
+                </button>
+              </div>
+            </div>
+          `;
+          
+          container.appendChild(backdrop);
+          container.appendChild(modal);
+          
+          // Add enter key support
+          setTimeout(() => {
+            const input = document.getElementById(inputId);
+            if (input) {
+              input.focus();
+              input.addEventListener('keypress', (e) => {
+                if (e.key === 'Enter') {
+                  this.closePrompt(inputId, 'ok');
+                }
+              });
+            }
+          }, 100);
+          
+          window.promptResolve = resolve;
+        });
+      },
+      
+      closePrompt(inputId, action) {
+        const container = document.getElementById('modal-container');
+        const input = document.getElementById(inputId);
+        const value = input ? input.value : '';
+        
+        container.innerHTML = '';
+        
+        if (window.promptResolve) {
+          if (action === null) {
+            window.promptResolve(null); // User cancelled
+          } else {
+            window.promptResolve(value); // Return the input value
+          }
+          window.promptResolve = null;
+        }
+      },
+      
+      setLoading(isLoading) {
+        this.loading = isLoading;
+        if (isLoading) {
+          const loadingEl = document.getElementById('loading-overlay');
+          if (!loadingEl) {
+            const overlay = document.createElement('div');
+            overlay.id = 'loading-overlay';
+            overlay.className = 'fixed inset-0 bg-black bg-opacity-30 flex items-center justify-center z-50';
+            overlay.innerHTML = '<div class="spinner"></div>';
+            document.body.appendChild(overlay);
+          }
+        } else {
+          const loadingEl = document.getElementById('loading-overlay');
+          if (loadingEl) loadingEl.remove();
+        }
+      },
       
       async init() {
-        await this.loadStats();
-        await this.loadPallets();
-        await this.loadLocations();
-        await this.loadActivity();
-        this.render();
+        this.setLoading(true);
+        try {
+          await Promise.all([
+            this.loadStats(),
+            this.loadPallets(),
+            this.loadLocations(),
+            this.loadActivity(),
+            this.loadCustomers()
+          ]);
+          this.render();
+        } catch (e) {
+          this.showToast('Error loading data. Please refresh the page.', 'error');
+        } finally {
+          this.setLoading(false);
+        }
       },
       
       async loadPallets() {
         try {
-          const res = await fetch(`${API_URL}/api/pallets`);
+          let url = `${API_URL}/api/pallets`;
+          if (this.selectedCustomer) {
+            url += `?customer=${encodeURIComponent(this.selectedCustomer)}`;
+          }
+          const res = await fetch(url);
           this.pallets = await res.json();
         } catch (e) {
           console.error('Error loading pallets:', e);
+          throw e;
+        }
+      },
+      
+      async loadCustomers() {
+        try {
+          const res = await fetch(`${API_URL}/api/customers`);
+          this.customers = await res.json();
+        } catch (e) {
+          console.error('Error loading customers:', e);
         }
       },
       
@@ -48,28 +450,40 @@
           this.locations = await res.json();
         } catch (e) {
           console.error('Error loading locations:', e);
+          throw e;
         }
       },
       
       async loadStats() {
         try {
-          const res = await fetch(`${API_URL}/api/stats`);
+          let url = `${API_URL}/api/stats`;
+          if (this.selectedCustomer) {
+            url += `?customer=${encodeURIComponent(this.selectedCustomer)}`;
+          }
+          const res = await fetch(url);
           this.stats = await res.json();
         } catch (e) {
           console.error('Error loading stats:', e);
+          throw e;
         }
       },
       
       async loadActivity() {
         try {
-          const res = await fetch(`${API_URL}/api/activity?limit=100`);
+          let url = `${API_URL}/api/activity?limit=100`;
+          if (this.selectedCustomer) {
+            url += `&customer=${encodeURIComponent(this.selectedCustomer)}`;
+          }
+          const res = await fetch(url);
           this.activityLog = await res.json();
         } catch (e) {
           console.error('Error loading activity:', e);
+          throw e;
         }
       },
       
       async checkIn(customerName, productId, quantity, location) {
+        this.setLoading(true);
         try {
           const res = await fetch(`${API_URL}/api/pallets`, {
             method: 'POST',
@@ -77,54 +491,68 @@
             body: JSON.stringify({ customer_name: customerName, product_id: productId, quantity, location })
           });
           const data = await res.json();
-          alert(data.message || 'Pallet checked in!');
+          this.showToast(data.message || 'Pallet checked in successfully!', 'success');
+          await this.loadCustomers();
           await this.loadPallets();
           await this.loadStats();
           await this.loadActivity();
           this.render();
         } catch (e) {
-          alert('Error checking in pallet');
+          this.showToast('Error checking in pallet', 'error');
           console.error(e);
+        } finally {
+          this.setLoading(false);
         }
       },
       
       async checkOut(palletId) {
-        if (!confirm('Remove entire pallet?')) return;
+        const confirmed = await this.confirm('Remove Pallet', 'Are you sure you want to remove this entire pallet from inventory?');
+        if (!confirmed) return;
+        
+        this.setLoading(true);
         try {
           const res = await fetch(`${API_URL}/api/pallets/${palletId}`, { method: 'DELETE' });
           const data = await res.json();
-          alert(data.message || 'Pallet checked out!');
+          this.showToast(data.message || 'Pallet checked out successfully!', 'success');
           await this.loadPallets();
           await this.loadStats();
           await this.loadActivity();
           this.render();
         } catch (e) {
-          alert('Error checking out pallet');
+          this.showToast('Error checking out pallet', 'error');
           console.error(e);
+        } finally {
+          this.setLoading(false);
         }
       },
       
       async removePartialQuantity(palletId) {
         const pallet = this.pallets.find(p => p.id === palletId);
         if (!pallet) {
-          alert('Pallet not found');
+          this.showToast('Pallet not found', 'error');
           return;
         }
         
-        const qtyToRemove = prompt(`Current quantity: ${pallet.quantity}\n\nHow many units to remove?`, '1');
+        const qtyToRemove = await this.prompt(
+          'Remove Quantity',
+          `Current quantity: <strong>${pallet.quantity}</strong><br><br>How many units to remove?`,
+          '1'
+        );
+        
         if (qtyToRemove === null) return;
         
         const qty = parseInt(qtyToRemove);
         if (isNaN(qty) || qty <= 0) {
-          alert('Please enter a valid quantity');
+          this.showToast('Please enter a valid quantity', 'error');
           return;
         }
         
         if (qty > pallet.quantity) {
-          alert(`Cannot remove ${qty} units. Only ${pallet.quantity} available.`);
+          this.showToast(`Cannot remove ${qty} units. Only ${pallet.quantity} available.`, 'error');
           return;
         }
         
+        this.setLoading(true);
         try {
           const res = await fetch(`${API_URL}/api/pallets/${palletId}/remove-quantity`, {
             method: 'POST',
@@ -132,14 +560,16 @@
             body: JSON.stringify({ quantity_to_remove: qty })
           });
           const data = await res.json();
-          alert(data.message || 'Quantity removed!');
+          this.showToast(data.message || 'Quantity removed successfully!', 'success');
           await this.loadPallets();
           await this.loadStats();
           await this.loadActivity();
           this.render();
         } catch (e) {
-          alert('Error removing quantity');
+          this.showToast('Error removing quantity', 'error');
           console.error(e);
+        } finally {
+          this.setLoading(false);
         }
       },
       
@@ -151,10 +581,8 @@
           const html5QrCode = new Html5Qrcode("qr-reader");
           this.scanner = html5QrCode;
           
-          // Request camera permissions first
           Html5Qrcode.getCameras().then(cameras => {
             if (cameras && cameras.length > 0) {
-              // Use back camera if available (better for scanning)
               const cameraId = cameras.length > 1 ? cameras[1].id : cameras[0].id;
               
               html5QrCode.start(
@@ -173,20 +601,20 @@
                 }
               ).catch(err => {
                 console.error("Camera start error:", err);
-                alert("Camera access denied or not available. Please enable camera permissions in your browser settings, then try again.");
+                this.showToast("Camera access denied. Please enable camera permissions.", 'error');
                 this.stopScanner();
                 this.scanMode = null;
                 this.render();
               });
             } else {
-              alert("No cameras found on this device. Please use manual entry.");
+              this.showToast("No cameras found. Please use manual entry.", 'error');
               this.stopScanner();
               this.scanMode = null;
               this.render();
             }
           }).catch(err => {
             console.error("Camera detection error:", err);
-            alert("Unable to access camera. Please ensure:\n1. You're using HTTPS (or localhost)\n2. Camera permissions are enabled\n3. No other app is using the camera\n\nUse manual entry instead.");
+            this.showToast("Unable to access camera. Please ensure camera permissions are enabled.", 'error');
             this.stopScanner();
             this.scanMode = null;
             this.render();
@@ -194,24 +622,25 @@
         }, 100);
       },
       
-      handleScan(code) {
+      async handleScan(code) {
         if (this.scanMode === 'checkin-pallet') {
           this.tempPallet = code;
           this.stopScanner();
+          this.showToast('Pallet scanned! Now scan location...', 'success');
           setTimeout(() => {
             this.scanMode = 'checkin-location';
             this.startScanner('checkin-location');
           }, 500);
         } else if (this.scanMode === 'checkin-location') {
           this.stopScanner();
-          const customerName = prompt('Enter Customer Name:');
+          const customerName = await this.prompt('Customer Name', 'Enter customer name:');
           if (!customerName) {
             this.scanMode = null;
             this.tempPallet = null;
             this.render();
             return;
           }
-          const qty = prompt('Enter quantity:', '1');
+          const qty = await this.prompt('Quantity', 'Enter quantity:', '1');
           if (qty !== null) {
             this.checkIn(customerName, this.tempPallet, parseInt(qty) || 1, code);
           }
@@ -239,19 +668,32 @@
         }
       },
       
-      showManualEntry() {
-        const customerName = prompt('Enter Customer Name (e.g., Godbold, Council):');
-        if (!customerName) return;
-        
-        const productId = prompt('Enter Product ID:');
-        if (!productId) return;
-        
-        const quantity = prompt('Enter Quantity:', '1');
-        const location = prompt('Enter Location (e.g., A1-L3):');
-        
-        if (location) {
-          this.checkIn(customerName, productId, parseInt(quantity) || 1, location);
+      async showManualEntry() {
+        const customerName = await this.prompt('Customer Name', 'Enter customer name (e.g., Godbold, Council):');
+        if (customerName === null) return; // User clicked cancel
+        if (!customerName.trim()) {
+          this.showToast('Customer name is required', 'error');
+          return;
         }
+        
+        const productId = await this.prompt('Product ID', 'Enter product ID:');
+        if (productId === null) return; // User clicked cancel
+        if (!productId.trim()) {
+          this.showToast('Product ID is required', 'error');
+          return;
+        }
+        
+        const quantity = await this.prompt('Quantity', 'Enter quantity:', '1');
+        if (quantity === null) return; // User clicked cancel
+        
+        const location = await this.prompt('Location', 'Enter location (e.g., A1-L3):');
+        if (location === null) return; // User clicked cancel
+        if (!location.trim()) {
+          this.showToast('Location is required', 'error');
+          return;
+        }
+        
+        this.checkIn(customerName.trim(), productId.trim(), parseInt(quantity) || 1, location.trim());
       },
       
       async generateQRCode(text, containerId) {
@@ -259,11 +701,9 @@
           setTimeout(() => {
             const container = document.getElementById(containerId);
             if (container) {
-              // Clear any existing QR code
               container.innerHTML = '';
               
               try {
-                // Use QRCode.js library (different from canvas-based)
                 new QRCode(container, {
                   text: text,
                   width: 200,
@@ -293,8 +733,8 @@
       async generateLocationQRs() {
         this.view = 'location-qrs';
         this.render();
+        this.setLoading(true);
         
-        // Generate QR codes after render
         setTimeout(async () => {
           const aisles = this.locations.reduce((acc, loc) => {
             if (!acc.includes(loc.aisle)) acc.push(loc.aisle);
@@ -307,35 +747,67 @@
               await this.generateQRCode(loc.id, `qr-${loc.id}`);
             }
           }
+          
+          this.setLoading(false);
+          this.showToast('All QR codes generated successfully!', 'success');
         }, 200);
       },
       
       async generatePalletQR() {
-        const palletId = prompt('Enter Pallet ID (or leave blank for auto-generated):');
-        const finalId = palletId || `PLT-${Date.now()}`;
+        const palletId = await this.prompt('Pallet ID', 'Enter pallet ID (or leave blank for auto-generated):');
+        if (palletId === null) return; // User clicked cancel
         
-        const customerName = prompt('Enter Customer Name:');
-        if (!customerName) return;
+        const finalId = palletId.trim() || `PLT-${Date.now()}`;
         
-        const productDesc = prompt('Enter Product Description (optional):', '');
-        const quantity = prompt('Enter Quantity:', '1');
+        const customerName = await this.prompt('Customer Name', 'Enter customer name:');
+        if (customerName === null) return; // User clicked cancel
+        if (!customerName.trim()) {
+          this.showToast('Customer name is required', 'error');
+          return;
+        }
+        
+        const productDesc = await this.prompt('Product Description', 'Enter product description (optional):', '');
+        if (productDesc === null) return; // User clicked cancel
+        
+        const quantity = await this.prompt('Quantity', 'Enter quantity:', '1');
+        if (quantity === null) return; // User clicked cancel
         
         this.view = 'single-qr';
         this.tempPallet = {
           id: finalId,
-          customer: customerName,
-          product: productDesc,
+          customer: customerName.trim(),
+          product: productDesc.trim(),
           quantity: parseInt(quantity) || 1
         };
         this.render();
         
         setTimeout(async () => {
           await this.generateQRCode(finalId, 'single-qr-canvas');
+          this.showToast('QR code generated successfully!', 'success');
         }, 100);
       },
       
       printQRCodes() {
         window.print();
+      },
+      
+      async filterByCustomer(customer) {
+        this.selectedCustomer = customer;
+        this.searchTerm = '';
+        this.setLoading(true);
+        try {
+          await this.loadPallets();
+          await this.loadStats();
+          await this.loadActivity();
+          this.render();
+          if (customer) {
+            this.showToast(`Filtered by: ${customer}`, 'info');
+          }
+        } catch (e) {
+          this.showToast('Error filtering data', 'error');
+        } finally {
+          this.setLoading(false);
+        }
       },
       
       render() {
@@ -346,31 +818,47 @@
         );
         
         document.getElementById('app').innerHTML = `
-          <div class="bg-blue-600 text-white p-4 shadow-lg print:hidden">
-            <h1 class="text-2xl font-bold">Warehouse Tracker</h1>
-            <div class="mt-2 text-sm">
-              <span class="mr-4">📦 ${this.stats.total_pallets || 0} Pallets</span>
-              <span class="mr-4">✓ ${this.stats.occupied_locations || 0} Occupied</span>
-              <span>□ ${(this.stats.total_locations || 480) - (this.stats.occupied_locations || 0)} Available</span>
+          <div class="bg-gradient-to-r from-blue-600 to-blue-700 text-white p-4 shadow-lg print:hidden">
+            <h1 class="text-2xl font-bold flex items-center gap-2">
+              📦 Warehouse Tracker
+            </h1>
+            <div class="mt-3 flex flex-wrap gap-3 text-sm">
+              <div class="bg-white bg-opacity-20 px-3 py-1 rounded-full">
+                <span class="font-semibold">${this.stats.total_pallets || 0}</span> Pallets
+              </div>
+              <div class="bg-white bg-opacity-20 px-3 py-1 rounded-full">
+                <span class="font-semibold">${this.stats.occupied_locations || 0}</span> Occupied
+              </div>
+              <div class="bg-white bg-opacity-20 px-3 py-1 rounded-full">
+                <span class="font-semibold">${(this.stats.total_locations || 480) - (this.stats.occupied_locations || 0)}</span> Available
+              </div>
             </div>
+            ${this.selectedCustomer ? `
+              <div class="mt-3 bg-blue-800 px-4 py-2 rounded-lg inline-flex items-center gap-3">
+                <span class="text-sm">📋 <strong>${this.selectedCustomer}</strong></span>
+                <button onclick="app.filterByCustomer('')" class="bg-white text-blue-600 px-3 py-1 rounded-full text-xs font-semibold hover:bg-blue-50">
+                  ✕ Clear
+                </button>
+              </div>
+            ` : ''}
           </div>
           
-          <div class="bg-white border-b sticky top-0 z-10 flex print:hidden">
-            <button onclick="app.view='scan'; app.render()" class="flex-1 py-3 ${this.view === 'scan' ? 'bg-blue-50 text-blue-600 border-b-2 border-blue-600' : 'text-gray-600'}">
+          <div class="bg-white border-b sticky top-0 z-10 flex shadow-sm print:hidden">
+            <button onclick="app.view='scan'; app.render()" class="flex-1 py-4 text-sm font-semibold ${this.view === 'scan' ? 'bg-blue-50 text-blue-600 border-b-2 border-blue-600' : 'text-gray-600 hover:bg-gray-50'}">
               📷 Scan
             </button>
-            <button onclick="app.view='inventory'; app.render()" class="flex-1 py-3 ${this.view === 'inventory' ? 'bg-blue-50 text-blue-600 border-b-2 border-blue-600' : 'text-gray-600'}">
+            <button onclick="app.view='inventory'; app.render()" class="flex-1 py-4 text-sm font-semibold ${this.view === 'inventory' ? 'bg-blue-50 text-blue-600 border-b-2 border-blue-600' : 'text-gray-600 hover:bg-gray-50'}">
               📋 Inventory
             </button>
-            <button onclick="app.view='qr-generator'; app.render()" class="flex-1 py-3 ${this.view === 'qr-generator' ? 'bg-blue-50 text-blue-600 border-b-2 border-blue-600' : 'text-gray-600'}">
+            <button onclick="app.view='qr-generator'; app.render()" class="flex-1 py-4 text-sm font-semibold ${this.view === 'qr-generator' ? 'bg-blue-50 text-blue-600 border-b-2 border-blue-600' : 'text-gray-600 hover:bg-gray-50'}">
               🏷️ QR Codes
             </button>
-            <button onclick="app.view='history'; app.render()" class="flex-1 py-3 ${this.view === 'history' ? 'bg-blue-50 text-blue-600 border-b-2 border-blue-600' : 'text-gray-600'}">
+            <button onclick="app.view='history'; app.render()" class="flex-1 py-4 text-sm font-semibold ${this.view === 'history' ? 'bg-blue-50 text-blue-600 border-b-2 border-blue-600' : 'text-gray-600 hover:bg-gray-50'}">
               📜 History
             </button>
           </div>
           
-          <div class="p-4">
+          <div class="p-4 fade-in">
             ${this.view === 'scan' ? this.renderScan() : 
               this.view === 'inventory' ? this.renderInventory(filtered) :
               this.view === 'qr-generator' ? this.renderQRGenerator() :
@@ -399,23 +887,29 @@
               p.customer_name.toLowerCase().includes(this.searchTerm.toLowerCase())
             );
             
-            const resultsDiv = document.querySelector('.space-y-2');
+            const resultsDiv = document.querySelector('.inventory-results');
             if (resultsDiv) {
               resultsDiv.innerHTML = filtered.length === 0 ? 
-                '<div class="text-center text-gray-500 py-8 text-lg">No pallets found</div>' :
+                `<div class="text-center text-gray-500 py-12">
+                  <div class="text-4xl mb-2">🔍</div>
+                  <div class="text-lg">No pallets found</div>
+                </div>` :
                 filtered.map(p => `
-                  <div class="bg-white p-4 rounded-lg shadow flex justify-between items-start">
+                  <div class="bg-white p-4 rounded-xl shadow-sm card-hover flex justify-between items-start border border-gray-100">
                     <div class="flex-1">
-                      <h3 class="font-bold text-lg">${p.product_id}</h3>
-                      <p class="text-blue-600 font-semibold">👤 ${p.customer_name}</p>
-                      <p class="text-gray-600">📍 ${p.location}</p>
-                      <p class="text-sm text-gray-500">Qty: ${p.quantity} • ${new Date(p.date_added).toLocaleDateString()}</p>
+                      <h3 class="font-bold text-lg text-gray-900">${p.product_id}</h3>
+                      <p class="text-blue-600 font-semibold text-sm mt-1">👤 ${p.customer_name}</p>
+                      <p class="text-gray-600 text-sm mt-1">📍 ${p.location}</p>
+                      <p class="text-xs text-gray-500 mt-2">
+                        <span class="bg-blue-50 text-blue-700 px-2 py-1 rounded-full font-semibold">Qty: ${p.quantity}</span>
+                        <span class="ml-2">${new Date(p.date_added).toLocaleDateString()}</span>
+                      </p>
                     </div>
-                    <div class="flex flex-col gap-2">
-                      <button onclick="app.removePartialQuantity('${p.id}')" class="bg-orange-500 text-white px-3 py-2 rounded text-sm hover:bg-orange-600">
+                    <div class="flex flex-col gap-2 ml-4">
+                      <button onclick="app.removePartialQuantity('${p.id}')" class="bg-orange-500 text-white px-4 py-2 rounded-lg text-sm font-semibold hover:bg-orange-600 shadow-sm">
                         Remove Qty
                       </button>
-                      <button onclick="app.checkOut('${p.id}')" class="bg-red-500 text-white px-3 py-2 rounded text-sm hover:bg-red-600">
+                      <button onclick="app.checkOut('${p.id}')" class="bg-red-500 text-white px-4 py-2 rounded-lg text-sm font-semibold hover:bg-red-600 shadow-sm">
                         Remove All
                       </button>
                     </div>
@@ -429,34 +923,45 @@
       renderScan() {
         if (!this.scanMode) {
           return `
-            <div class="space-y-3">
-              <button onclick="app.startScanner('checkin-pallet')" class="w-full bg-green-500 text-white p-4 rounded-lg shadow hover:bg-green-600 text-lg">
-                ✓ Check In Pallet
+            <div class="max-w-md mx-auto space-y-3">
+              <button onclick="app.startScanner('checkin-pallet')" class="w-full bg-gradient-to-r from-green-500 to-green-600 text-white p-5 rounded-xl shadow-lg hover:shadow-xl font-bold text-lg flex items-center justify-center gap-3">
+                <span class="text-2xl">✓</span> Check In Pallet
               </button>
-              <button onclick="app.startScanner('checkout')" class="w-full bg-red-500 text-white p-4 rounded-lg shadow hover:bg-red-600 text-lg">
-                ✗ Check Out Pallet
+              <button onclick="app.startScanner('checkout')" class="w-full bg-gradient-to-r from-red-500 to-red-600 text-white p-5 rounded-xl shadow-lg hover:shadow-xl font-bold text-lg flex items-center justify-center gap-3">
+                <span class="text-2xl">✗</span> Check Out Pallet
               </button>
-              <button onclick="app.showManualEntry()" class="w-full bg-gray-500 text-white p-4 rounded-lg shadow hover:bg-gray-600 text-lg">
-                ✎ Manual Entry
+              <button onclick="app.showManualEntry()" class="w-full bg-gradient-to-r from-gray-500 to-gray-600 text-white p-5 rounded-xl shadow-lg hover:shadow-xl font-bold text-lg flex items-center justify-center gap-3">
+                <span class="text-2xl">✎</span> Manual Entry
               </button>
+              
+              <div class="mt-6 p-4 bg-blue-50 rounded-xl border border-blue-200">
+                <p class="text-sm text-blue-800 text-center">
+                  📱 <strong>Tip:</strong> Make sure you're using HTTPS for camera access
+                </p>
+              </div>
             </div>
           `;
         } else {
           return `
-            <div class="space-y-4">
-              <div class="bg-white p-4 rounded-lg shadow">
-                <h3 class="font-bold mb-2 text-lg">
+            <div class="max-w-md mx-auto space-y-4">
+              <div class="bg-gradient-to-r from-blue-500 to-blue-600 text-white p-6 rounded-xl shadow-lg">
+                <h3 class="font-bold mb-2 text-xl">
                   ${this.scanMode === 'checkin-pallet' ? '📦 Step 1: Scan Pallet QR Code' : 
                     this.scanMode === 'checkin-location' ? '📍 Step 2: Scan Location QR Code' : 
                     '📦 Scan Pallet to Remove'}
                 </h3>
-                ${this.tempPallet ? `<p class="text-green-600 font-semibold">✓ Pallet: ${this.tempPallet}</p>` : ''}
+                ${this.tempPallet ? `
+                  <div class="mt-3 bg-white bg-opacity-20 px-4 py-2 rounded-lg">
+                    <p class="text-sm">Pallet Scanned:</p>
+                    <p class="font-mono font-bold text-lg">${this.tempPallet}</p>
+                  </div>
+                ` : ''}
               </div>
               
-              <div id="qr-reader" class="border-4 border-blue-500 rounded-lg overflow-hidden"></div>
+              <div id="qr-reader" class="border-4 border-blue-500 rounded-xl overflow-hidden shadow-lg"></div>
               
-              <button onclick="app.stopScanner(); app.scanMode = null; app.tempPallet = null; app.render()" class="w-full bg-gray-500 text-white p-3 rounded-lg text-lg">
-                Cancel
+              <button onclick="app.stopScanner(); app.scanMode = null; app.tempPallet = null; app.render()" class="w-full bg-gray-500 text-white p-4 rounded-xl text-lg font-semibold hover:bg-gray-600 shadow-lg">
+                Cancel Scanning
               </button>
             </div>
           `;
@@ -465,27 +970,33 @@
       
       renderQRGenerator() {
         return `
-          <div class="space-y-4">
-            <div class="bg-white p-6 rounded-lg shadow">
-              <h2 class="text-xl font-bold mb-4">QR Code Generator</h2>
-              <p class="text-gray-600 mb-6">Generate QR codes for scanning pallets and locations</p>
+          <div class="max-w-md mx-auto space-y-4">
+            <div class="bg-white p-6 rounded-xl shadow-lg border border-gray-200">
+              <h2 class="text-2xl font-bold mb-2 text-gray-900">🏷️ QR Code Generator</h2>
+              <p class="text-gray-600 mb-6">Create QR codes for scanning pallets and warehouse locations</p>
               
               <div class="space-y-3">
-                <button onclick="app.generatePalletQR()" class="w-full bg-blue-500 text-white p-4 rounded-lg shadow hover:bg-blue-600 text-lg">
-                  🏷️ Generate Pallet QR Code
+                <button onclick="app.generatePalletQR()" class="w-full bg-gradient-to-r from-blue-500 to-blue-600 text-white p-5 rounded-xl shadow-md hover:shadow-lg font-bold text-lg flex items-center justify-center gap-3">
+                  <span class="text-2xl">🏷️</span> Generate Pallet QR Code
                 </button>
                 
-                <button onclick="app.generateLocationQRs()" class="w-full bg-purple-500 text-white p-4 rounded-lg shadow hover:bg-purple-600 text-lg">
-                  📍 Generate All Location QR Codes
+                <button onclick="app.generateLocationQRs()" class="w-full bg-gradient-to-r from-purple-500 to-purple-600 text-white p-5 rounded-xl shadow-md hover:shadow-lg font-bold text-lg flex items-center justify-center gap-3">
+                  <span class="text-2xl">📍</span> Generate All Location QR Codes
                 </button>
               </div>
             </div>
             
-            <div class="bg-yellow-50 border-l-4 border-yellow-400 p-4">
-              <p class="text-sm text-yellow-800">
-                <strong>Tip:</strong> After generating QR codes, use your browser's print function to print labels. 
-                Location QR codes are organized by aisle for easy labeling.
-              </p>
+            <div class="bg-yellow-50 border-l-4 border-yellow-400 p-4 rounded-r-xl">
+              <div class="flex gap-3">
+                <div class="text-2xl">💡</div>
+                <div>
+                  <p class="font-semibold text-yellow-800 mb-1">Printing Tips</p>
+                  <p class="text-sm text-yellow-700">
+                    After generating, use your browser's print function (Ctrl+P / Cmd+P) to print labels. 
+                    Location codes are organized by aisle for easy labeling.
+                  </p>
+                </div>
+              </div>
             </div>
           </div>
         `;
@@ -495,51 +1006,51 @@
         const pallet = this.tempPallet;
         return `
           <div class="max-w-md mx-auto">
-            <div id="print-label" class="bg-white p-6 rounded-lg shadow text-center border-2 border-gray-300">
-              <h2 class="text-xl font-bold mb-2 print:text-2xl">Pallet Label</h2>
+            <div id="print-label" class="bg-white p-8 rounded-xl shadow-lg text-center border-2 border-gray-200">
+              <h2 class="text-2xl font-bold mb-4 print:text-3xl text-gray-900">🏷️ Pallet Label</h2>
               
-              <div class="bg-gray-50 p-4 rounded-lg inline-block mb-4">
+              <div class="bg-gradient-to-br from-gray-50 to-gray-100 p-6 rounded-xl inline-block mb-6 border border-gray-200">
                 <div id="single-qr-canvas"></div>
               </div>
               
-              <div class="border-t-2 border-gray-300 pt-4 text-left">
-                <div class="mb-2">
-                  <span class="text-gray-600 text-sm">Pallet ID:</span>
-                  <p class="font-mono text-lg font-bold">${pallet.id}</p>
+              <div class="border-t-2 border-gray-200 pt-6 text-left space-y-4">
+                <div class="bg-gray-50 p-3 rounded-lg">
+                  <span class="text-gray-600 text-sm font-semibold">Pallet ID:</span>
+                  <p class="font-mono text-xl font-bold text-gray-900 mt-1">${pallet.id}</p>
                 </div>
                 
-                <div class="mb-2">
-                  <span class="text-gray-600 text-sm">Customer:</span>
-                  <p class="font-semibold text-lg">${pallet.customer}</p>
+                <div class="bg-blue-50 p-3 rounded-lg">
+                  <span class="text-gray-600 text-sm font-semibold">Customer:</span>
+                  <p class="font-bold text-xl text-blue-600 mt-1">${pallet.customer}</p>
                 </div>
                 
                 ${pallet.product ? `
-                  <div class="mb-2">
-                    <span class="text-gray-600 text-sm">Product:</span>
-                    <p class="font-medium">${pallet.product}</p>
+                  <div class="bg-gray-50 p-3 rounded-lg">
+                    <span class="text-gray-600 text-sm font-semibold">Product:</span>
+                    <p class="font-semibold text-lg text-gray-900 mt-1">${pallet.product}</p>
                   </div>
                 ` : ''}
                 
-                <div class="mb-2">
-                  <span class="text-gray-600 text-sm">Quantity:</span>
-                  <p class="font-bold text-xl text-blue-600">${pallet.quantity}</p>
+                <div class="bg-green-50 p-3 rounded-lg">
+                  <span class="text-gray-600 text-sm font-semibold">Quantity:</span>
+                  <p class="font-bold text-3xl text-green-600 mt-1">${pallet.quantity}</p>
                 </div>
                 
-                <div class="text-xs text-gray-500 mt-4">
+                <div class="text-xs text-gray-500 mt-6 text-center">
                   Generated: ${new Date().toLocaleString()}
                 </div>
               </div>
             </div>
             
-            <div class="mt-6 space-y-2 print:hidden">
-              <button onclick="app.printQRCodes()" class="w-full bg-blue-500 text-white p-3 rounded-lg hover:bg-blue-600">
-                🖨️ Print Label
+            <div class="mt-6 space-y-3 print:hidden">
+              <button onclick="app.printQRCodes()" class="w-full bg-blue-600 text-white p-4 rounded-xl font-bold hover:bg-blue-700 shadow-lg flex items-center justify-center gap-2">
+                <span class="text-xl">🖨️</span> Print Label
               </button>
-              <button onclick="app.generatePalletQR()" class="w-full bg-gray-500 text-white p-3 rounded-lg hover:bg-gray-600">
+              <button onclick="app.generatePalletQR()" class="w-full bg-gray-500 text-white p-4 rounded-xl font-bold hover:bg-gray-600 shadow-lg">
                 Generate Another
               </button>
-              <button onclick="app.view='qr-generator'; app.render()" class="w-full bg-gray-300 text-gray-700 p-3 rounded-lg hover:bg-gray-400">
-                Back
+              <button onclick="app.view='qr-generator'; app.render()" class="w-full bg-gray-300 text-gray-700 p-4 rounded-xl font-bold hover:bg-gray-400">
+                Back to Generator
               </button>
             </div>
           </div>
@@ -554,7 +1065,7 @@
                 top: 50%; 
                 transform: translate(-50%, -50%);
                 border: 2px solid #000;
-                padding: 20px;
+                padding: 30px;
               }
             }
           </style>
@@ -569,12 +1080,12 @@
         
         return `
           <div class="print:p-0">
-            <div class="mb-4 print:hidden">
-              <button onclick="app.printQRCodes()" class="bg-blue-500 text-white px-6 py-3 rounded-lg hover:bg-blue-600 mr-2">
-                🖨️ Print All QR Codes
+            <div class="mb-6 flex gap-3 print:hidden">
+              <button onclick="app.printQRCodes()" class="bg-blue-600 text-white px-6 py-3 rounded-xl font-bold hover:bg-blue-700 shadow-lg flex items-center gap-2">
+                <span class="text-xl">🖨️</span> Print All QR Codes
               </button>
-              <button onclick="app.view='qr-generator'; app.render()" class="bg-gray-500 text-white px-6 py-3 rounded-lg hover:bg-gray-600">
-                Back
+              <button onclick="app.view='qr-generator'; app.render()" class="bg-gray-500 text-white px-6 py-3 rounded-xl font-bold hover:bg-gray-600 shadow-lg">
+                ← Back
               </button>
             </div>
             
@@ -582,12 +1093,14 @@
               const aisleLocations = this.locations.filter(l => l.aisle === aisle);
               return `
                 <div class="mb-8 print:break-after-page">
-                  <h2 class="text-2xl font-bold mb-4 print:text-3xl">Aisle ${aisle}</h2>
+                  <h2 class="text-3xl font-bold mb-6 print:text-4xl text-gray-900 bg-gradient-to-r from-blue-600 to-purple-600 text-white p-4 rounded-xl inline-block">
+                    Aisle ${aisle}
+                  </h2>
                   <div class="grid grid-cols-4 gap-4 print:grid-cols-6 print:gap-2">
                     ${aisleLocations.map(loc => `
-                      <div class="bg-white p-3 rounded-lg shadow text-center print:border print:border-gray-300">
+                      <div class="bg-white p-4 rounded-xl shadow-md text-center border border-gray-200 print:border print:border-gray-300">
                         <div id="qr-${loc.id}" class="mx-auto flex items-center justify-center" style="min-height: 120px;"></div>
-                        <p class="mt-2 font-mono text-sm font-semibold print:text-xs">${loc.id}</p>
+                        <p class="mt-3 font-mono text-sm font-bold print:text-xs text-gray-900">${loc.id}</p>
                       </div>
                     `).join('')}
                   </div>
@@ -595,54 +1108,77 @@
               `;
             }).join('')}
           </div>
-          
-          <style>
-            @media print {
-              .print\\:hidden { display: none !important; }
-              .print\\:break-after-page { page-break-after: always; }
-              body { background: white; }
-              .print\\:p-0 { padding: 0; }
-              .print\\:border { border: 1px solid #d1d5db; }
-              .print\\:grid-cols-6 { grid-template-columns: repeat(6, minmax(0, 1fr)); }
-              .print\\:gap-2 { gap: 0.5rem; }
-              .print\\:text-3xl { font-size: 1.875rem; }
-              .print\\:text-xs { font-size: 0.75rem; }
-            }
-          </style>
         `;
       },
       
       renderInventory(pallets) {
         return `
-          <div class="mb-4 flex gap-2">
-            <input 
-              id="search-input"
-              type="text" 
-              placeholder="Search customer, product or location..." 
-              value="${this.searchTerm}"
-              class="flex-1 border p-3 rounded text-lg"
-            />
-            <a href="${API_URL}/api/export" download class="bg-blue-500 text-white px-4 py-3 rounded flex items-center">
-              ⬇ Export
-            </a>
+          <div class="mb-4 space-y-3">
+            <div class="flex gap-3 flex-wrap">
+              <select 
+                id="customer-filter"
+                class="border-2 border-gray-300 p-3 rounded-xl text-base bg-white font-semibold focus:ring-2 focus:ring-blue-500 focus:border-blue-500 shadow-sm"
+                onchange="app.filterByCustomer(this.value)"
+              >
+                <option value="">👥 All Customers</option>
+                ${this.customers.map(customer => `
+                  <option value="${customer}" ${this.selectedCustomer === customer ? 'selected' : ''}>
+                    ${customer}
+                  </option>
+                `).join('')}
+              </select>
+              
+              <input 
+                id="search-input"
+                type="text" 
+                placeholder="🔍 Search product or location..." 
+                value="${this.searchTerm}"
+                class="flex-1 border-2 border-gray-300 p-3 rounded-xl text-base focus:ring-2 focus:ring-blue-500 focus:border-blue-500 shadow-sm"
+              />
+              
+              <a href="${API_URL}/api/export${this.selectedCustomer ? '?customer=' + encodeURIComponent(this.selectedCustomer) : ''}" download class="bg-blue-600 text-white px-6 py-3 rounded-xl flex items-center whitespace-nowrap font-semibold hover:bg-blue-700 shadow-lg">
+                ⬇ Export CSV
+              </a>
+            </div>
+            
+            ${this.selectedCustomer ? `
+              <div class="bg-blue-50 border-l-4 border-blue-500 px-5 py-3 rounded-r-xl shadow-sm">
+                <p class="text-sm text-blue-800">
+                  <strong class="font-bold">${pallets.length} pallet(s)</strong> for <strong class="font-bold">${this.selectedCustomer}</strong>
+                </p>
+              </div>
+            ` : ''}
           </div>
           
-          <div class="space-y-2">
+          <div class="space-y-3 inventory-results">
             ${pallets.length === 0 ? 
-              '<div class="text-center text-gray-500 py-8 text-lg">No pallets found</div>' :
+              `<div class="text-center text-gray-500 py-16">
+                <div class="text-6xl mb-4">📦</div>
+                <div class="text-xl font-semibold mb-2">No pallets found</div>
+                <p class="text-gray-400">${this.selectedCustomer ? `No inventory for ${this.selectedCustomer}` : 'Start by checking in a pallet'}</p>
+              </div>` :
               pallets.map(p => `
-                <div class="bg-white p-4 rounded-lg shadow flex justify-between items-start">
+                <div class="bg-white p-5 rounded-xl shadow-sm card-hover flex justify-between items-start border border-gray-100">
                   <div class="flex-1">
-                    <h3 class="font-bold text-lg">${p.product_id}</h3>
-                    <p class="text-blue-600 font-semibold">👤 ${p.customer_name}</p>
-                    <p class="text-gray-600">📍 ${p.location}</p>
-                    <p class="text-sm text-gray-500">Qty: ${p.quantity} • Added: ${new Date(p.date_added).toLocaleDateString()}</p>
+                    <h3 class="font-bold text-xl text-gray-900">${p.product_id}</h3>
+                    <p class="text-blue-600 font-semibold text-sm mt-2 flex items-center gap-2">
+                      <span class="text-lg">👤</span> ${p.customer_name}
+                    </p>
+                    <p class="text-gray-600 text-sm mt-2 flex items-center gap-2">
+                      <span class="text-lg">📍</span> ${p.location}
+                    </p>
+                    <p class="text-sm text-gray-500 mt-3 flex items-center gap-3">
+                      <span class="bg-gradient-to-r from-blue-100 to-blue-50 text-blue-700 px-3 py-1 rounded-full font-bold">
+                        Qty: ${p.quantity}
+                      </span>
+                      <span class="text-xs">Added ${new Date(p.date_added).toLocaleDateString()}</span>
+                    </p>
                   </div>
-                  <div class="flex flex-col gap-2">
-                    <button onclick="app.removePartialQuantity('${p.id}')" class="bg-orange-500 text-white px-3 py-2 rounded text-sm hover:bg-orange-600">
+                  <div class="flex flex-col gap-2 ml-4">
+                    <button onclick="app.removePartialQuantity('${p.id}')" class="bg-orange-500 text-white px-4 py-2 rounded-xl text-sm font-bold hover:bg-orange-600 shadow-md whitespace-nowrap">
                       Remove Qty
                     </button>
-                    <button onclick="app.checkOut('${p.id}')" class="bg-red-500 text-white px-3 py-2 rounded text-sm hover:bg-red-600">
+                    <button onclick="app.checkOut('${p.id}')" class="bg-red-500 text-white px-4 py-2 rounded-xl text-sm font-bold hover:bg-red-600 shadow-md whitespace-nowrap">
                       Remove All
                     </button>
                   </div>
@@ -655,64 +1191,104 @@
       
       renderHistory() {
         const getActionBadge = (action) => {
-          if (action === 'CHECK_IN') return '<span class="bg-green-100 text-green-800 px-2 py-1 rounded text-xs font-semibold">✓ Check In</span>';
-          if (action === 'CHECK_OUT') return '<span class="bg-red-100 text-red-800 px-2 py-1 rounded text-xs font-semibold">✗ Check Out</span>';
-          if (action === 'PARTIAL_REMOVE') return '<span class="bg-orange-100 text-orange-800 px-2 py-1 rounded text-xs font-semibold">↓ Partial Remove</span>';
+          if (action === 'CHECK_IN') return '<span class="bg-green-100 text-green-800 px-3 py-1 rounded-full text-xs font-bold">✓ Check In</span>';
+          if (action === 'CHECK_OUT') return '<span class="bg-red-100 text-red-800 px-3 py-1 rounded-full text-xs font-bold">✗ Check Out</span>';
+          if (action === 'PARTIAL_REMOVE') return '<span class="bg-orange-100 text-orange-800 px-3 py-1 rounded-full text-xs font-bold">↓ Partial Remove</span>';
           return action;
         };
         
         return `
-          <div class="mb-4">
-            <h2 class="text-xl font-bold text-gray-800">Activity History</h2>
-            <p class="text-sm text-gray-600">Last 100 activities</p>
+          <div class="mb-6">
+            <div class="flex justify-between items-center mb-4 flex-wrap gap-3">
+              <div>
+                <h2 class="text-2xl font-bold text-gray-900 flex items-center gap-2">
+                  📜 Activity History
+                </h2>
+                <p class="text-sm text-gray-600 mt-1">Last 100 activities</p>
+              </div>
+              
+              ${this.customers.length > 0 ? `
+                <select 
+                  id="history-customer-filter"
+                  class="border-2 border-gray-300 p-3 rounded-xl text-sm bg-white font-semibold focus:ring-2 focus:ring-blue-500 focus:border-blue-500 shadow-sm"
+                  onchange="app.filterByCustomer(this.value)"
+                >
+                  <option value="">All Customers</option>
+                  ${this.customers.map(customer => `
+                    <option value="${customer}" ${this.selectedCustomer === customer ? 'selected' : ''}>
+                      ${customer}
+                    </option>
+                  `).join('')}
+                </select>
+              ` : ''}
+            </div>
+            
+            ${this.selectedCustomer ? `
+              <div class="bg-blue-50 border-l-4 border-blue-500 px-5 py-3 rounded-r-xl shadow-sm">
+                <p class="text-sm text-blue-800">
+                  Showing activity for <strong class="font-bold">${this.selectedCustomer}</strong>
+                  <button onclick="app.filterByCustomer('')" class="ml-3 underline font-semibold hover:text-blue-600">Clear Filter</button>
+                </p>
+              </div>
+            ` : ''}
           </div>
           
-          <div class="space-y-2">
+          <div class="space-y-3">
             ${this.activityLog.length === 0 ? 
-              '<div class="text-center text-gray-500 py-8 text-lg">No activity yet</div>' :
+              `<div class="text-center text-gray-500 py-16">
+                <div class="text-6xl mb-4">📋</div>
+                <div class="text-xl font-semibold mb-2">No activity yet</div>
+                <p class="text-gray-400">${this.selectedCustomer ? `No activity for ${this.selectedCustomer}` : 'Activity will appear here after check-ins/check-outs'}</p>
+              </div>` :
               this.activityLog.map(a => `
-                <div class="bg-white p-4 rounded-lg shadow">
-                  <div class="flex justify-between items-start mb-2">
+                <div class="bg-white p-5 rounded-xl shadow-sm card-hover border border-gray-100">
+                  <div class="flex justify-between items-start mb-3">
                     <div class="flex-1">
-                      <h3 class="font-bold text-lg">${a.product_id}</h3>
-                      <p class="text-blue-600 font-semibold text-sm">👤 ${a.customer_name}</p>
+                      <h3 class="font-bold text-lg text-gray-900">${a.product_id}</h3>
+                      <p class="text-blue-600 font-semibold text-sm mt-1 flex items-center gap-2">
+                        <span>👤</span> ${a.customer_name}
+                      </p>
                     </div>
                     ${getActionBadge(a.action)}
                   </div>
                   
-                  <div class="grid grid-cols-2 gap-2 text-sm mt-2">
-                    <div>
-                      <span class="text-gray-600">Location:</span>
-                      <span class="font-semibold ml-1">${a.location}</span>
+                  <div class="grid grid-cols-2 gap-3 text-sm mt-4">
+                    <div class="bg-gray-50 p-2 rounded-lg">
+                      <span class="text-gray-600 text-xs">Location:</span>
+                      <span class="font-semibold ml-2 text-gray-900">${a.location}</span>
                     </div>
                     ${a.action === 'PARTIAL_REMOVE' || a.action === 'CHECK_OUT' ? `
-                      <div>
-                        <span class="text-gray-600">Removed:</span>
-                        <span class="font-semibold ml-1 text-red-600">${a.quantity_changed}</span>
+                      <div class="bg-red-50 p-2 rounded-lg">
+                        <span class="text-gray-600 text-xs">Removed:</span>
+                        <span class="font-bold ml-2 text-red-600">${a.quantity_changed}</span>
                       </div>
                     ` : ''}
                     ${a.action === 'PARTIAL_REMOVE' ? `
-                      <div>
-                        <span class="text-gray-600">Before:</span>
-                        <span class="font-semibold ml-1">${a.quantity_before}</span>
+                      <div class="bg-gray-50 p-2 rounded-lg">
+                        <span class="text-gray-600 text-xs">Before:</span>
+                        <span class="font-semibold ml-2">${a.quantity_before}</span>
                       </div>
-                      <div>
-                        <span class="text-gray-600">After:</span>
-                        <span class="font-semibold ml-1">${a.quantity_after}</span>
+                      <div class="bg-gray-50 p-2 rounded-lg">
+                        <span class="text-gray-600 text-xs">After:</span>
+                        <span class="font-semibold ml-2">${a.quantity_after}</span>
                       </div>
                     ` : ''}
                     ${a.action === 'CHECK_IN' ? `
-                      <div>
-                        <span class="text-gray-600">Quantity:</span>
-                        <span class="font-semibold ml-1 text-green-600">${a.quantity_after}</span>
+                      <div class="bg-green-50 p-2 rounded-lg">
+                        <span class="text-gray-600 text-xs">Quantity:</span>
+                        <span class="font-bold ml-2 text-green-600">${a.quantity_after}</span>
                       </div>
                     ` : ''}
                   </div>
                   
-                  ${a.notes ? `<p class="text-xs text-gray-500 mt-2 italic">${a.notes}</p>` : ''}
+                  ${a.notes ? `
+                    <div class="mt-3 p-3 bg-gray-50 rounded-lg">
+                      <p class="text-xs text-gray-600 italic">${a.notes}</p>
+                    </div>
+                  ` : ''}
                   
-                  <p class="text-xs text-gray-400 mt-2">
-                    📅 ${new Date(a.timestamp).toLocaleString()}
+                  <p class="text-xs text-gray-400 mt-3 flex items-center gap-2">
+                    <span>📅</span> ${new Date(a.timestamp).toLocaleString()}
                   </p>
                 </div>
               `).join('')
