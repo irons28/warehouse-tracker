@@ -27,13 +27,50 @@ const db = new sqlite3.Database("./warehouse.db", (err) => {
 
 // Create tables
 db.serialize(() => {
+  // Check and migrate pallets table
+  db.all("PRAGMA table_info(pallets)", (err, columns) => {
+    if (err) {
+      console.error("Error checking table structure:", err);
+      return;
+    }
+
+    if (columns.length > 0) {
+      const hasQuantity = columns.some((col) => col.name === "quantity");
+      const hasPalletQuantity = columns.some(
+        (col) => col.name === "pallet_quantity",
+      );
+
+      if (hasQuantity && !hasPalletQuantity) {
+        console.log("🔄 Migrating database to new schema...");
+
+        db.run(
+          "ALTER TABLE pallets ADD COLUMN pallet_quantity INTEGER DEFAULT 1",
+        );
+        db.run(
+          "ALTER TABLE pallets ADD COLUMN product_quantity INTEGER DEFAULT 0",
+        );
+
+        setTimeout(() => {
+          db.run(
+            "UPDATE pallets SET pallet_quantity = quantity WHERE pallet_quantity IS NULL OR pallet_quantity = 0",
+          );
+          db.run(
+            "UPDATE pallets SET product_quantity = 0 WHERE product_quantity IS NULL",
+          );
+          console.log("✓ Migration complete");
+        }, 500);
+      }
+    }
+  });
+
   // Pallets table
   db.run(
     `CREATE TABLE IF NOT EXISTS pallets (
     id TEXT PRIMARY KEY,
     customer_name TEXT NOT NULL,
     product_id TEXT NOT NULL,
-    quantity INTEGER DEFAULT 1,
+    pallet_quantity INTEGER DEFAULT 1,
+    product_quantity INTEGER DEFAULT 0,
     location TEXT NOT NULL,
     date_added DATETIME DEFAULT CURRENT_TIMESTAMP,
     date_removed DATETIME,
@@ -143,13 +180,20 @@ app.get("/api/pallets/search", (req, res) => {
     (err, rows) => {
       if (err) return res.status(500).json({ error: err.message });
       res.json(rows);
-    },
+    }
   );
 });
 
 // Check in a pallet
 app.post("/api/pallets", (req, res) => {
-  const { id, customer_name, product_id, quantity, location } = req.body;
+  const {
+    id,
+    customer_name,
+    product_id,
+    pallet_quantity,
+    product_quantity,
+    location,
+  } = req.body;
 
   if (!customer_name || !product_id || !location) {
     return res
@@ -160,8 +204,15 @@ app.post("/api/pallets", (req, res) => {
   const palletId = id || `PLT-${Date.now()}`;
 
   db.run(
-    "INSERT INTO pallets (id, customer_name, product_id, quantity, location) VALUES (?, ?, ?, ?, ?)",
-    [palletId, customer_name, product_id, quantity || 1, location],
+    "INSERT INTO pallets (id, customer_name, product_id, pallet_quantity, product_quantity, location) VALUES (?, ?, ?, ?, ?, ?)",
+    [
+      palletId,
+      customer_name,
+      product_id,
+      pallet_quantity || 1,
+      product_quantity || 0,
+      location,
+    ],
     function (err) {
       if (err) return res.status(500).json({ error: err.message });
 
@@ -175,8 +226,8 @@ app.post("/api/pallets", (req, res) => {
           customer_name,
           product_id,
           "CHECK_IN",
-          quantity || 1,
-          quantity || 1,
+          pallet_quantity || 1,
+          pallet_quantity || 1,
           location,
         ],
       );
@@ -185,7 +236,8 @@ app.post("/api/pallets", (req, res) => {
         id: palletId,
         customer_name,
         product_id,
-        quantity: quantity || 1,
+        pallet_quantity: pallet_quantity || 1,
+        product_quantity: product_quantity || 0,
         location,
         message: "Pallet checked in successfully",
       });
@@ -209,7 +261,7 @@ app.post("/api/pallets/:id/remove-quantity", (req, res) => {
       if (err) return res.status(500).json({ error: err.message });
       if (!row) return res.status(404).json({ error: "Pallet not found" });
 
-      const quantityBefore = row.quantity;
+      const quantityBefore = row.pallet_quantity;
       const quantityAfter = quantityBefore - quantity_to_remove;
 
       if (quantityAfter < 0) {
@@ -221,7 +273,7 @@ app.post("/api/pallets/:id/remove-quantity", (req, res) => {
       if (quantityAfter === 0) {
         // Remove entire pallet if quantity reaches 0
         db.run(
-          'UPDATE pallets SET status = "removed", date_removed = CURRENT_TIMESTAMP, quantity = 0 WHERE id = ?',
+          'UPDATE pallets SET status = "removed", date_removed = CURRENT_TIMESTAMP, pallet_quantity = 0 WHERE id = ?',
           [row.id],
           (err) => {
             if (err) return res.status(500).json({ error: err.message });
@@ -247,7 +299,7 @@ app.post("/api/pallets/:id/remove-quantity", (req, res) => {
             );
 
             res.json({
-              message: "All quantity removed. Pallet checked out.",
+              message: "All pallets removed. Location freed.",
               quantity_removed: quantity_to_remove,
               quantity_remaining: 0,
               pallet_removed: true,
@@ -257,7 +309,7 @@ app.post("/api/pallets/:id/remove-quantity", (req, res) => {
       } else {
         // Update quantity
         db.run(
-          "UPDATE pallets SET quantity = ? WHERE id = ?",
+          "UPDATE pallets SET pallet_quantity = ? WHERE id = ?",
           [quantityAfter, row.id],
           (err) => {
             if (err) return res.status(500).json({ error: err.message });
@@ -278,7 +330,7 @@ app.post("/api/pallets/:id/remove-quantity", (req, res) => {
             );
 
             res.json({
-              message: `Removed ${quantity_to_remove} units. ${quantityAfter} remaining.`,
+              message: `Removed ${quantity_to_remove} pallet(s). ${quantityAfter} remaining.`,
               quantity_removed: quantity_to_remove,
               quantity_remaining: quantityAfter,
               pallet_removed: false,
@@ -286,7 +338,7 @@ app.post("/api/pallets/:id/remove-quantity", (req, res) => {
           },
         );
       }
-    },
+    }
   );
 });
 
@@ -319,8 +371,8 @@ app.delete("/api/pallets/:id", (req, res) => {
               row.customer_name,
               row.product_id,
               "CHECK_OUT",
-              row.quantity,
-              row.quantity,
+              row.pallet_quantity,
+              row.pallet_quantity,
               row.location,
               "Full pallet removed",
             ],
@@ -329,7 +381,7 @@ app.delete("/api/pallets/:id", (req, res) => {
           res.json({ message: "Pallet checked out successfully" });
         },
       );
-    },
+    }
   );
 });
 
@@ -369,7 +421,7 @@ app.get("/api/stats", (req, res) => {
           occupied_locations: locationRow.occupied_locations,
           total_locations: locationRow.total_locations,
         });
-      },
+      }
     );
   });
 });
@@ -414,11 +466,13 @@ app.get("/api/export", (req, res) => {
   db.all(query, params, (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
 
-    const csv = ["Customer,Product ID,Quantity,Location,Date Added"]
+    const csv = [
+      "Customer,Product ID,Pallet Qty,Product Qty,Location,Date Added",
+    ]
       .concat(
         rows.map(
           (p) =>
-            `${p.customer_name},${p.product_id},${p.quantity},${p.location},${p.date_added}`,
+            `${p.customer_name},${p.product_id},${p.pallet_quantity},${p.product_quantity},${p.location},${p.date_added}`,
         ),
       )
       .join("\n");
@@ -436,7 +490,7 @@ app.get("/api/customers", (req, res) => {
     (err, rows) => {
       if (err) return res.status(500).json({ error: err.message });
       res.json(rows.map((r) => r.customer_name));
-    },
+    }
   );
 });
 
@@ -448,8 +502,7 @@ function getLocalIPs() {
 
   for (const name of Object.keys(nets)) {
     for (const net of nets[name]) {
-      // Skip internal (loopback) and non-IPv4 addresses
-      if (net.family === 'IPv4' && !net.internal) {
+      if (net.family === "IPv4" && !net.internal) {
         results.push(net.address);
       }
     }
@@ -468,12 +521,12 @@ http.createServer(app).listen(PORT, "0.0.0.0", () => {
   console.log("\n🚀 Warehouse Server Running!");
   console.log(`\n📱 Access from devices on network:`);
   console.log(`   Local: http://localhost:${PORT}`);
-
+  
   const ips = getLocalIPs();
   ips.forEach((ip) => {
     console.log(`   Network: http://${ip}:${PORT}`);
   });
-
+  
   if (!hasSSL) {
     console.log("\n⚠️  HTTPS not enabled - camera features require HTTPS!");
     console.log("   To enable HTTPS, run: npm run generate-ssl");
@@ -492,12 +545,12 @@ if (hasSSL) {
     console.log("\n🔒 HTTPS Server Running!");
     console.log(`\n📱 Secure access (for camera features):`);
     console.log(`   Local: https://localhost:${HTTPS_PORT}`);
-
+    
     const ips = getLocalIPs();
     ips.forEach((ip) => {
       console.log(`   Network: https://${ip}:${HTTPS_PORT}`);
     });
-
+    
     console.log("\n✅ Camera scanning will work on mobile devices!");
     console.log(
       "   (You may need to accept the self-signed certificate warning)\n",

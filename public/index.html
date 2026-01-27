@@ -9,12 +9,7 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
   <style>
-    /* Smooth transitions */
-    * {
-      transition: all 0.2s ease-in-out;
-    }
-    
-    /* Loading spinner */
+    * { transition: all 0.2s ease-in-out; }
     .spinner {
       border: 3px solid #f3f4f6;
       border-top: 3px solid #3b82f6;
@@ -23,13 +18,10 @@
       height: 40px;
       animation: spin 1s linear infinite;
     }
-    
     @keyframes spin {
       0% { transform: rotate(0deg); }
       100% { transform: rotate(360deg); }
     }
-    
-    /* Toast notifications */
     .toast {
       position: fixed;
       top: 20px;
@@ -45,49 +37,18 @@
       align-items: center;
       gap: 12px;
     }
-    
-    .toast.success {
-      background: #10b981;
-      color: white;
-    }
-    
-    .toast.error {
-      background: #ef4444;
-      color: white;
-    }
-    
-    .toast.info {
-      background: #3b82f6;
-      color: white;
-    }
-    
+    .toast.success { background: #10b981; color: white; }
+    .toast.error { background: #ef4444; color: white; }
+    .toast.info { background: #3b82f6; color: white; }
     @keyframes slideIn {
-      from {
-        transform: translateX(400px);
-        opacity: 0;
-      }
-      to {
-        transform: translateX(0);
-        opacity: 1;
-      }
+      from { transform: translateX(400px); opacity: 0; }
+      to { transform: translateX(0); opacity: 1; }
     }
-    
     @keyframes slideOut {
-      from {
-        transform: translateX(0);
-        opacity: 1;
-      }
-      to {
-        transform: translateX(400px);
-        opacity: 0;
-      }
+      from { transform: translateX(0); opacity: 1; }
+      to { transform: translateX(400px); opacity: 0; }
     }
-    
-    .toast.hiding {
-      animation: slideOut 0.3s ease-out;
-    }
-    
-    /* Modal backdrop */
+    .toast.hiding { animation: slideOut 0.3s ease-out; }
     .modal-backdrop {
       position: fixed;
       top: 0;
@@ -98,13 +59,10 @@
       z-index: 9998;
       animation: fadeIn 0.2s ease-out;
     }
-    
     @keyframes fadeIn {
       from { opacity: 0; }
       to { opacity: 1; }
     }
-    
-    /* Modal */
     .modal {
       position: fixed;
       top: 50%;
@@ -117,76 +75,27 @@
       max-width: 90%;
       animation: modalSlideIn 0.3s ease-out;
     }
-    
     @keyframes modalSlideIn {
-      from {
-        opacity: 0;
-        transform: translate(-50%, -45%);
-      }
-      to {
-        opacity: 1;
-        transform: translate(-50%, -50%);
-      }
+      from { opacity: 0; transform: translate(-50%, -45%); }
+      to { opacity: 1; transform: translate(-50%, -50%); }
     }
-    
-    /* Card hover effects */
     .card-hover {
       transition: transform 0.2s, box-shadow 0.2s;
     }
-    
     .card-hover:hover {
       transform: translateY(-2px);
       box-shadow: 0 8px 20px rgba(0,0,0,0.15);
     }
-    
-    /* Button press effect */
-    button:active {
-      transform: scale(0.97);
-    }
-    
-    /* Skeleton loader */
-    .skeleton {
-      background: linear-gradient(90deg, #f3f4f6 25%, #e5e7eb 50%, #f3f4f6 75%);
-      background-size: 200% 100%;
-      animation: shimmer 1.5s infinite;
-    }
-    
-    @keyframes shimmer {
-      0% { background-position: 200% 0; }
-      100% { background-position: -200% 0; }
-    }
-    
-    /* Fade in animation */
-    .fade-in {
-      animation: fadeInUp 0.4s ease-out;
-    }
-    
+    button:active { transform: scale(0.97); }
+    .fade-in { animation: fadeInUp 0.4s ease-out; }
     @keyframes fadeInUp {
-      from {
-        opacity: 0;
-        transform: translateY(20px);
-      }
-      to {
-        opacity: 1;
-        transform: translateY(0);
-      }
+      from { opacity: 0; transform: translateY(20px); }
+      to { opacity: 1; transform: translateY(0); }
     }
-    
-    /* Mobile improvements */
     @media (max-width: 640px) {
-      .toast {
-        left: 10px;
-        right: 10px;
-        min-width: auto;
-      }
-      
-      .modal {
-        max-width: 95%;
-        width: 95%;
-      }
+      .toast { left: 10px; right: 10px; min-width: auto; }
+      .modal { max-width: 95%; width: 95%; }
     }
-    
-    /* Print styles */
     @media print {
       .print\\:hidden { display: none !important; }
       .print\\:break-after-page { page-break-after: always; }
@@ -224,34 +133,24 @@
       charts: {},
       googleSheetsUrl: localStorage.getItem('googleSheetsUrl') || '',
       
-      // Toast notification system
       showToast(message, type = 'info') {
         const container = document.getElementById('toast-container');
         const toast = document.createElement('div');
         toast.className = `toast ${type}`;
-        
         const icon = type === 'success' ? '✓' : type === 'error' ? '✗' : 'ℹ';
-        toast.innerHTML = `
-          <div style="font-size: 24px;">${icon}</div>
-          <div style="flex: 1;">${message}</div>
-        `;
-        
+        toast.innerHTML = `<div style="font-size: 24px;">${icon}</div><div style="flex: 1;">${message}</div>`;
         container.appendChild(toast);
-        
         setTimeout(() => {
           toast.classList.add('hiding');
           setTimeout(() => toast.remove(), 300);
         }, 3000);
       },
       
-      // Modal system
       showModal(title, content, buttons = []) {
         return new Promise((resolve) => {
           const container = document.getElementById('modal-container');
-          
           const backdrop = document.createElement('div');
           backdrop.className = 'modal-backdrop';
-          
           const modal = document.createElement('div');
           modal.className = 'modal';
           modal.innerHTML = `
@@ -260,20 +159,15 @@
               <div class="mb-6">${content}</div>
               <div class="flex gap-2 justify-end">
                 ${buttons.map((btn, i) => `
-                  <button 
-                    onclick="app.closeModal(${i})" 
-                    class="px-4 py-2 rounded-lg font-semibold ${btn.primary ? 'bg-blue-600 text-white hover:bg-blue-700' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'}"
-                  >
+                  <button onclick="app.closeModal(${i})" class="px-4 py-2 rounded-lg font-semibold ${btn.primary ? 'bg-blue-600 text-white hover:bg-blue-700' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'}">
                     ${btn.text}
                   </button>
                 `).join('')}
               </div>
             </div>
           `;
-          
           container.appendChild(backdrop);
           container.appendChild(modal);
-          
           window.modalResolve = resolve;
           window.modalButtons = buttons;
         });
@@ -283,12 +177,9 @@
         const container = document.getElementById('modal-container');
         const input = container.querySelector('input');
         const inputValue = input ? input.value : null;
-        
         container.innerHTML = '';
-        
         if (window.modalResolve) {
           const buttonValue = window.modalButtons[buttonIndex].value;
-          // If it's a prompt dialog (has OK button), return the input value
           if (buttonValue === 'ok' && inputValue !== null) {
             window.modalResolve(inputValue);
           } else {
@@ -297,29 +188,20 @@
         }
       },
       
-      // Confirmation dialog
       async confirm(title, message) {
-        const result = await this.showModal(
-          title,
-          `<p class="text-gray-700">${message}</p>`,
-          [
-            { text: 'Cancel', value: false },
-            { text: 'Confirm', value: true, primary: true }
-          ]
-        );
+        const result = await this.showModal(title, `<p class="text-gray-700">${message}</p>`, [
+          { text: 'Cancel', value: false },
+          { text: 'Confirm', value: true, primary: true }
+        ]);
         return result;
       },
       
-      // Prompt dialog
       async prompt(title, message, defaultValue = '') {
         const inputId = 'modal-input-' + Date.now();
-        
         return new Promise((resolve) => {
           const container = document.getElementById('modal-container');
-          
           const backdrop = document.createElement('div');
           backdrop.className = 'modal-backdrop';
-          
           const modal = document.createElement('div');
           modal.className = 'modal';
           modal.innerHTML = `
@@ -327,47 +209,25 @@
               <h3 class="text-xl font-bold mb-4">${title}</h3>
               <div class="mb-6">
                 <p class="text-gray-700 mb-3">${message}</p>
-                <input 
-                  id="${inputId}" 
-                  type="text" 
-                  value="${defaultValue}" 
-                  class="w-full border border-gray-300 rounded-lg px-4 py-2 text-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-                  autofocus
-                />
+                <input id="${inputId}" type="text" value="${defaultValue}" class="w-full border border-gray-300 rounded-lg px-4 py-2 text-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500" autofocus/>
               </div>
               <div class="flex gap-2 justify-end">
-                <button 
-                  onclick="app.closePrompt('${inputId}', null)" 
-                  class="px-4 py-2 rounded-lg font-semibold bg-gray-200 text-gray-700 hover:bg-gray-300"
-                >
-                  Cancel
-                </button>
-                <button 
-                  onclick="app.closePrompt('${inputId}', 'ok')" 
-                  class="px-4 py-2 rounded-lg font-semibold bg-blue-600 text-white hover:bg-blue-700"
-                >
-                  OK
-                </button>
+                <button onclick="app.closePrompt('${inputId}', null)" class="px-4 py-2 rounded-lg font-semibold bg-gray-200 text-gray-700 hover:bg-gray-300">Cancel</button>
+                <button onclick="app.closePrompt('${inputId}', 'ok')" class="px-4 py-2 rounded-lg font-semibold bg-blue-600 text-white hover:bg-blue-700">OK</button>
               </div>
             </div>
           `;
-          
           container.appendChild(backdrop);
           container.appendChild(modal);
-          
-          // Add enter key support
           setTimeout(() => {
             const input = document.getElementById(inputId);
             if (input) {
               input.focus();
               input.addEventListener('keypress', (e) => {
-                if (e.key === 'Enter') {
-                  this.closePrompt(inputId, 'ok');
-                }
+                if (e.key === 'Enter') this.closePrompt(inputId, 'ok');
               });
             }
           }, 100);
-          
           window.promptResolve = resolve;
         });
       },
@@ -376,15 +236,9 @@
         const container = document.getElementById('modal-container');
         const input = document.getElementById(inputId);
         const value = input ? input.value : '';
-        
         container.innerHTML = '';
-        
         if (window.promptResolve) {
-          if (action === null) {
-            window.promptResolve(null); // User cancelled
-          } else {
-            window.promptResolve(value); // Return the input value
-          }
+          window.promptResolve(action === null ? null : value);
           window.promptResolve = null;
         }
       },
@@ -485,23 +339,29 @@
         }
       },
       
-      async checkIn(customerName, productId, quantity, location) {
+      async checkIn(customerName, productId, palletQuantity, productQuantity, location) {
         this.setLoading(true);
         try {
           const res = await fetch(`${API_URL}/api/pallets`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ customer_name: customerName, product_id: productId, quantity, location })
+            body: JSON.stringify({ 
+              customer_name: customerName, 
+              product_id: productId, 
+              pallet_quantity: palletQuantity,
+              product_quantity: productQuantity,
+              location 
+            })
           });
           const data = await res.json();
           this.showToast(data.message || 'Pallet checked in successfully!', 'success');
           
-          // Sync to Google Sheets
           if (this.googleSheetsUrl) {
             await this.syncToGoogleSheets('add_pallet', {
               customer_name: customerName,
               product_id: productId,
-              quantity: quantity,
+              pallet_quantity: palletQuantity,
+              product_quantity: productQuantity,
               location: location,
               date_added: new Date().toISOString()
             });
@@ -532,7 +392,6 @@
           const data = await res.json();
           this.showToast(data.message || 'Pallet checked out successfully!', 'success');
           
-          // Sync to Google Sheets
           if (this.googleSheetsUrl && pallet) {
             await this.syncToGoogleSheets('remove_pallet', {
               product_id: pallet.product_id,
@@ -560,8 +419,8 @@
         }
         
         const qtyToRemove = await this.prompt(
-          'Remove Quantity',
-          `Current quantity: <strong>${pallet.quantity}</strong><br><br>How many units to remove?`,
+          'Remove Pallets',
+          `Current pallet quantity: <strong>${pallet.pallet_quantity}</strong><br><br>How many pallets to remove?`,
           '1'
         );
         
@@ -573,8 +432,8 @@
           return;
         }
         
-        if (qty > pallet.quantity) {
-          this.showToast(`Cannot remove ${qty} units. Only ${pallet.quantity} available.`, 'error');
+        if (qty > pallet.pallet_quantity) {
+          this.showToast(`Cannot remove ${qty} pallets. Only ${pallet.pallet_quantity} available.`, 'error');
           return;
         }
         
@@ -586,11 +445,10 @@
             body: JSON.stringify({ quantity_to_remove: qty })
           });
           const data = await res.json();
-          this.showToast(data.message || 'Quantity removed successfully!', 'success');
+          this.showToast(data.message || 'Pallets removed successfully!', 'success');
           
-          // Sync to Google Sheets
           if (this.googleSheetsUrl) {
-            const newQuantity = pallet.quantity - qty;
+            const newQuantity = pallet.pallet_quantity - qty;
             if (newQuantity === 0) {
               await this.syncToGoogleSheets('remove_pallet', {
                 product_id: pallet.product_id,
@@ -610,7 +468,7 @@
           await this.loadActivity();
           this.render();
         } catch (e) {
-          this.showToast('Error removing quantity', 'error');
+          this.showToast('Error removing pallets', 'error');
           console.error(e);
         } finally {
           this.setLoading(false);
@@ -631,18 +489,12 @@
               
               html5QrCode.start(
                 cameraId,
-                {
-                  fps: 10,
-                  qrbox: { width: 250, height: 250 },
-                  aspectRatio: 1.0
-                },
+                { fps: 10, qrbox: { width: 250, height: 250 }, aspectRatio: 1.0 },
                 (decodedText) => {
                   this.handleScan(decodedText);
                   html5QrCode.stop().catch(err => console.log('Stop error:', err));
                 },
-                (errorMessage) => {
-                  // Scanning errors are normal, ignore them
-                }
+                (errorMessage) => {}
               ).catch(err => {
                 console.error("Camera start error:", err);
                 this.showToast("Camera access denied. Please enable camera permissions.", 'error');
@@ -684,9 +536,16 @@
             this.render();
             return;
           }
-          const qty = await this.prompt('Quantity', 'Enter quantity:', '1');
-          if (qty !== null) {
-            this.checkIn(customerName, this.tempPallet, parseInt(qty) || 1, code);
+          const palletQty = await this.prompt('Pallet Quantity', 'How many pallets?', '1');
+          if (palletQty === null) {
+            this.scanMode = null;
+            this.tempPallet = null;
+            this.render();
+            return;
+          }
+          const productQty = await this.prompt('Product Quantity (Optional)', 'Units per pallet (leave blank if not tracking):', '0');
+          if (productQty !== null) {
+            this.checkIn(customerName, this.tempPallet, parseInt(palletQty) || 1, parseInt(productQty) || 0, code);
           }
           this.scanMode = null;
           this.tempPallet = null;
@@ -714,30 +573,33 @@
       
       async showManualEntry() {
         const customerName = await this.prompt('Customer Name', 'Enter customer name (e.g., Godbold, Council):');
-        if (customerName === null) return; // User clicked cancel
+        if (customerName === null) return;
         if (!customerName.trim()) {
           this.showToast('Customer name is required', 'error');
           return;
         }
         
         const productId = await this.prompt('Product ID', 'Enter product ID:');
-        if (productId === null) return; // User clicked cancel
+        if (productId === null) return;
         if (!productId.trim()) {
           this.showToast('Product ID is required', 'error');
           return;
         }
         
-        const quantity = await this.prompt('Quantity', 'Enter quantity:', '1');
-        if (quantity === null) return; // User clicked cancel
+        const palletQuantity = await this.prompt('Pallet Quantity', 'How many pallets?', '1');
+        if (palletQuantity === null) return;
+        
+        const productQuantity = await this.prompt('Product Quantity (Optional)', 'Units per pallet (leave blank if not tracking):', '0');
+        if (productQuantity === null) return;
         
         const location = await this.prompt('Location', 'Enter location (e.g., A1-L3):');
-        if (location === null) return; // User clicked cancel
+        if (location === null) return;
         if (!location.trim()) {
           this.showToast('Location is required', 'error');
           return;
         }
         
-        this.checkIn(customerName.trim(), productId.trim(), parseInt(quantity) || 1, location.trim());
+        this.checkIn(customerName.trim(), productId.trim(), parseInt(palletQuantity) || 1, parseInt(productQuantity) || 0, location.trim());
       },
       
       async generateQRCode(text, containerId) {
@@ -746,7 +608,6 @@
             const container = document.getElementById(containerId);
             if (container) {
               container.innerHTML = '';
-              
               try {
                 new QRCode(container, {
                   text: text,
@@ -767,11 +628,6 @@
             }
           }, 100);
         });
-      },
-      
-      async showQRGenerator() {
-        this.view = 'qr-generator';
-        this.render();
       },
       
       async generateLocationQRs() {
@@ -799,29 +655,33 @@
       
       async generatePalletQR() {
         const palletId = await this.prompt('Pallet ID', 'Enter pallet ID (or leave blank for auto-generated):');
-        if (palletId === null) return; // User clicked cancel
+        if (palletId === null) return;
         
         const finalId = palletId.trim() || `PLT-${Date.now()}`;
         
         const customerName = await this.prompt('Customer Name', 'Enter customer name:');
-        if (customerName === null) return; // User clicked cancel
+        if (customerName === null) return;
         if (!customerName.trim()) {
           this.showToast('Customer name is required', 'error');
           return;
         }
         
         const productDesc = await this.prompt('Product Description', 'Enter product description (optional):', '');
-        if (productDesc === null) return; // User clicked cancel
+        if (productDesc === null) return;
         
-        const quantity = await this.prompt('Quantity', 'Enter quantity:', '1');
-        if (quantity === null) return; // User clicked cancel
+        const palletQuantity = await this.prompt('Pallet Quantity', 'How many pallets?', '1');
+        if (palletQuantity === null) return;
+        
+        const productQuantity = await this.prompt('Product Quantity (Optional)', 'Units per pallet:', '0');
+        if (productQuantity === null) return;
         
         this.view = 'single-qr';
         this.tempPallet = {
           id: finalId,
           customer: customerName.trim(),
           product: productDesc.trim(),
-          quantity: parseInt(quantity) || 1
+          palletQty: parseInt(palletQuantity) || 1,
+          productQty: parseInt(productQuantity) || 0
         };
         this.render();
         
@@ -835,14 +695,11 @@
         window.print();
       },
       
-      // Analytics & Reports
       initCharts() {
-        // Destroy existing charts
         Object.values(this.charts).forEach(chart => {
           if (chart) chart.destroy();
         });
         this.charts = {};
-        
         this.createCustomerChart();
         this.createLocationChart();
         this.createActivityChart();
@@ -851,17 +708,13 @@
       createCustomerChart() {
         const canvas = document.getElementById('customerChart');
         if (!canvas) return;
-        
-        // Group pallets by customer
         const customerData = {};
         this.pallets.forEach(p => {
           customerData[p.customer_name] = (customerData[p.customer_name] || 0) + 1;
         });
-        
         const labels = Object.keys(customerData);
         const data = Object.values(customerData);
         const colors = this.generateColors(labels.length);
-        
         this.charts.customer = new Chart(canvas, {
           type: 'doughnut',
           data: {
@@ -878,19 +731,8 @@
             responsive: true,
             maintainAspectRatio: false,
             plugins: {
-              legend: {
-                position: 'bottom',
-                labels: {
-                  padding: 15,
-                  font: { size: 12, weight: 'bold' }
-                }
-              },
-              title: {
-                display: true,
-                text: 'Inventory by Customer',
-                font: { size: 16, weight: 'bold' },
-                padding: 20
-              }
+              legend: { position: 'bottom', labels: { padding: 15, font: { size: 12, weight: 'bold' }}},
+              title: { display: true, text: 'Inventory by Customer', font: { size: 16, weight: 'bold' }, padding: 20 }
             }
           }
         });
@@ -899,17 +741,13 @@
       createLocationChart() {
         const canvas = document.getElementById('locationChart');
         if (!canvas) return;
-        
-        // Group by aisle
         const aisleData = {};
         this.pallets.forEach(p => {
           const aisle = p.location.charAt(0);
           aisleData[aisle] = (aisleData[aisle] || 0) + 1;
         });
-        
         const labels = Object.keys(aisleData).sort();
         const data = labels.map(aisle => aisleData[aisle]);
-        
         this.charts.location = new Chart(canvas, {
           type: 'bar',
           data: {
@@ -928,19 +766,9 @@
             maintainAspectRatio: false,
             plugins: {
               legend: { display: false },
-              title: {
-                display: true,
-                text: 'Pallets by Aisle',
-                font: { size: 16, weight: 'bold' },
-                padding: 20
-              }
+              title: { display: true, text: 'Pallets by Aisle', font: { size: 16, weight: 'bold' }, padding: 20 }
             },
-            scales: {
-              y: {
-                beginAtZero: true,
-                ticks: { stepSize: 1 }
-              }
-            }
+            scales: { y: { beginAtZero: true, ticks: { stepSize: 1 }}}
           }
         });
       },
@@ -948,12 +776,9 @@
       createActivityChart() {
         const canvas = document.getElementById('activityChart');
         if (!canvas) return;
-        
-        // Group activity by date (last 7 days)
         const dates = [];
         const checkIns = [];
         const checkOuts = [];
-        
         for (let i = 6; i >= 0; i--) {
           const date = new Date();
           date.setDate(date.getDate() - i);
@@ -1121,8 +946,9 @@
       
       renderReports() {
         // Calculate analytics
-        const totalQuantity = this.pallets.reduce((sum, p) => sum + p.quantity, 0);
-        const avgQuantity = this.pallets.length > 0 ? (totalQuantity / this.pallets.length).toFixed(1) : 0;
+        const totalPallets = this.pallets.reduce((sum, p) => sum + p.pallet_quantity, 0);
+        const totalUnits = this.pallets.reduce((sum, p) => sum + (p.pallet_quantity * (p.product_quantity || 0)), 0);
+        const avgPalletsPerEntry = this.pallets.length > 0 ? (totalPallets / this.pallets.length).toFixed(1) : 0;
         
         const utilizationRate = ((this.stats.occupied_locations / this.stats.total_locations) * 100).toFixed(1);
         
@@ -1174,7 +1000,7 @@
                 <div class="flex justify-between items-start">
                   <div>
                     <p class="text-blue-100 text-sm font-semibold">Total Pallets</p>
-                    <h3 class="text-4xl font-bold mt-2">${this.stats.total_pallets || 0}</h3>
+                    <h3 class="text-4xl font-bold mt-2">${totalPallets}</h3>
                   </div>
                   <div class="text-5xl opacity-50">📦</div>
                 </div>
@@ -1184,7 +1010,7 @@
                 <div class="flex justify-between items-start">
                   <div>
                     <p class="text-green-100 text-sm font-semibold">Total Units</p>
-                    <h3 class="text-4xl font-bold mt-2">${totalQuantity}</h3>
+                    <h3 class="text-4xl font-bold mt-2">${totalUnits > 0 ? totalUnits : 'N/A'}</h3>
                   </div>
                   <div class="text-5xl opacity-50">📊</div>
                 </div>
@@ -1291,8 +1117,8 @@
               <h3 class="text-xl font-bold text-gray-900 mb-4">📈 Summary Statistics</h3>
               <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
                 <div class="text-center">
-                  <p class="text-gray-600 text-sm font-semibold">Avg Quantity/Pallet</p>
-                  <p class="text-3xl font-bold text-gray-900 mt-1">${avgQuantity}</p>
+                  <p class="text-gray-600 text-sm font-semibold">Avg Pallets/Entry</p>
+                  <p class="text-3xl font-bold text-gray-900 mt-1">${avgPalletsPerEntry}</p>
                 </div>
                 <div class="text-center">
                   <p class="text-gray-600 text-sm font-semibold">Active Customers</p>
@@ -1303,8 +1129,8 @@
                   <p class="text-3xl font-bold text-gray-900 mt-1">${this.stats.total_locations - this.stats.occupied_locations}</p>
                 </div>
                 <div class="text-center">
-                  <p class="text-gray-600 text-sm font-semibold">Total Activities</p>
-                  <p class="text-3xl font-bold text-gray-900 mt-1">${this.activityLog.length}</p>
+                  <p class="text-gray-600 text-sm font-semibold">Inventory Entries</p>
+                  <p class="text-3xl font-bold text-gray-900 mt-1">${this.pallets.length}</p>
                 </div>
               </div>
             </div>
@@ -1391,7 +1217,7 @@
               <ol class="space-y-3 text-sm text-blue-800">
                 <li class="flex gap-3">
                   <span class="font-bold flex-shrink-0">1.</span>
-                  <span>Create a new Google Sheet with headers: <code class="bg-blue-100 px-2 py-1 rounded">Customer | Product ID | Quantity | Location | Date Added</code></span>
+                  <span>Create a new Google Sheet with headers: <code class="bg-blue-100 px-2 py-1 rounded">Customer | Product ID | Pallet Qty | Product Qty | Location | Date Added</code></span>
                 </li>
                 <li class="flex gap-3">
                   <span class="font-bold flex-shrink-0">2.</span>
@@ -1698,9 +1524,18 @@
                   </div>
                 ` : ''}
                 
-                <div class="bg-green-50 p-3 rounded-lg">
-                  <span class="text-gray-600 text-sm font-semibold">Quantity:</span>
-                  <p class="font-bold text-3xl text-green-600 mt-1">${pallet.quantity}</p>
+                <div class="grid grid-cols-2 gap-3">
+                  <div class="bg-green-50 p-3 rounded-lg">
+                    <span class="text-gray-600 text-xs font-semibold">Pallets:</span>
+                    <p class="font-bold text-2xl text-green-600 mt-1">${pallet.palletQty}</p>
+                  </div>
+                  
+                  ${pallet.productQty > 0 ? `
+                    <div class="bg-purple-50 p-3 rounded-lg">
+                      <span class="text-gray-600 text-xs font-semibold">Units/Pallet:</span>
+                      <p class="font-bold text-2xl text-purple-600 mt-1">${pallet.productQty}</p>
+                    </div>
+                  ` : ''}
                 </div>
                 
                 <div class="text-xs text-gray-500 mt-6 text-center">
@@ -1834,16 +1669,24 @@
                     <p class="text-gray-600 text-sm mt-2 flex items-center gap-2">
                       <span class="text-lg">📍</span> ${p.location}
                     </p>
-                    <p class="text-sm text-gray-500 mt-3 flex items-center gap-3">
-                      <span class="bg-gradient-to-r from-blue-100 to-blue-50 text-blue-700 px-3 py-1 rounded-full font-bold">
-                        Qty: ${p.quantity}
+                    <div class="text-sm mt-3 flex items-center gap-3 flex-wrap">
+                      <span class="bg-gradient-to-r from-green-100 to-green-50 text-green-700 px-3 py-1 rounded-full font-bold">
+                        🎫 ${p.pallet_quantity} pallet${p.pallet_quantity > 1 ? 's' : ''}
                       </span>
-                      <span class="text-xs">Added ${new Date(p.date_added).toLocaleDateString()}</span>
-                    </p>
+                      ${p.product_quantity > 0 ? `
+                        <span class="bg-gradient-to-r from-purple-100 to-purple-50 text-purple-700 px-3 py-1 rounded-full font-bold">
+                          📦 ${p.product_quantity} units/pallet
+                        </span>
+                        <span class="bg-gradient-to-r from-blue-100 to-blue-50 text-blue-700 px-3 py-1 rounded-full font-bold">
+                          = ${p.pallet_quantity * p.product_quantity} total units
+                        </span>
+                      ` : ''}
+                      <span class="text-xs text-gray-500">Added ${new Date(p.date_added).toLocaleDateString()}</span>
+                    </div>
                   </div>
                   <div class="flex flex-col gap-2 ml-4">
                     <button onclick="app.removePartialQuantity('${p.id}')" class="bg-orange-500 text-white px-4 py-2 rounded-xl text-sm font-bold hover:bg-orange-600 shadow-md whitespace-nowrap">
-                      Remove Qty
+                      Remove Pallets
                     </button>
                     <button onclick="app.checkOut('${p.id}')" class="bg-red-500 text-white px-4 py-2 rounded-xl text-sm font-bold hover:bg-red-600 shadow-md whitespace-nowrap">
                       Remove All
