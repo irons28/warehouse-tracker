@@ -7,6 +7,7 @@
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/html5-qrcode"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
   <style>
     /* Smooth transitions */
     * {
@@ -220,6 +221,8 @@
       searchTerm: '',
       scanner: null,
       loading: false,
+      charts: {},
+      googleSheetsUrl: localStorage.getItem('googleSheetsUrl') || '',
       
       // Toast notification system
       showToast(message, type = 'info') {
@@ -492,6 +495,18 @@
           });
           const data = await res.json();
           this.showToast(data.message || 'Pallet checked in successfully!', 'success');
+          
+          // Sync to Google Sheets
+          if (this.googleSheetsUrl) {
+            await this.syncToGoogleSheets('add_pallet', {
+              customer_name: customerName,
+              product_id: productId,
+              quantity: quantity,
+              location: location,
+              date_added: new Date().toISOString()
+            });
+          }
+          
           await this.loadCustomers();
           await this.loadPallets();
           await this.loadStats();
@@ -509,11 +524,22 @@
         const confirmed = await this.confirm('Remove Pallet', 'Are you sure you want to remove this entire pallet from inventory?');
         if (!confirmed) return;
         
+        const pallet = this.pallets.find(p => p.id === palletId);
+        
         this.setLoading(true);
         try {
           const res = await fetch(`${API_URL}/api/pallets/${palletId}`, { method: 'DELETE' });
           const data = await res.json();
           this.showToast(data.message || 'Pallet checked out successfully!', 'success');
+          
+          // Sync to Google Sheets
+          if (this.googleSheetsUrl && pallet) {
+            await this.syncToGoogleSheets('remove_pallet', {
+              product_id: pallet.product_id,
+              location: pallet.location
+            });
+          }
+          
           await this.loadPallets();
           await this.loadStats();
           await this.loadActivity();
@@ -561,6 +587,24 @@
           });
           const data = await res.json();
           this.showToast(data.message || 'Quantity removed successfully!', 'success');
+          
+          // Sync to Google Sheets
+          if (this.googleSheetsUrl) {
+            const newQuantity = pallet.quantity - qty;
+            if (newQuantity === 0) {
+              await this.syncToGoogleSheets('remove_pallet', {
+                product_id: pallet.product_id,
+                location: pallet.location
+              });
+            } else {
+              await this.syncToGoogleSheets('update_quantity', {
+                product_id: pallet.product_id,
+                location: pallet.location,
+                new_quantity: newQuantity
+              });
+            }
+          }
+          
           await this.loadPallets();
           await this.loadStats();
           await this.loadActivity();
@@ -791,6 +835,617 @@
         window.print();
       },
       
+      // Analytics & Reports
+      initCharts() {
+        // Destroy existing charts
+        Object.values(this.charts).forEach(chart => {
+          if (chart) chart.destroy();
+        });
+        this.charts = {};
+        
+        this.createCustomerChart();
+        this.createLocationChart();
+        this.createActivityChart();
+      },
+      
+      createCustomerChart() {
+        const canvas = document.getElementById('customerChart');
+        if (!canvas) return;
+        
+        // Group pallets by customer
+        const customerData = {};
+        this.pallets.forEach(p => {
+          customerData[p.customer_name] = (customerData[p.customer_name] || 0) + 1;
+        });
+        
+        const labels = Object.keys(customerData);
+        const data = Object.values(customerData);
+        const colors = this.generateColors(labels.length);
+        
+        this.charts.customer = new Chart(canvas, {
+          type: 'doughnut',
+          data: {
+            labels: labels,
+            datasets: [{
+              label: 'Pallets per Customer',
+              data: data,
+              backgroundColor: colors,
+              borderWidth: 2,
+              borderColor: '#fff'
+            }]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+              legend: {
+                position: 'bottom',
+                labels: {
+                  padding: 15,
+                  font: { size: 12, weight: 'bold' }
+                }
+              },
+              title: {
+                display: true,
+                text: 'Inventory by Customer',
+                font: { size: 16, weight: 'bold' },
+                padding: 20
+              }
+            }
+          }
+        });
+      },
+      
+      createLocationChart() {
+        const canvas = document.getElementById('locationChart');
+        if (!canvas) return;
+        
+        // Group by aisle
+        const aisleData = {};
+        this.pallets.forEach(p => {
+          const aisle = p.location.charAt(0);
+          aisleData[aisle] = (aisleData[aisle] || 0) + 1;
+        });
+        
+        const labels = Object.keys(aisleData).sort();
+        const data = labels.map(aisle => aisleData[aisle]);
+        
+        this.charts.location = new Chart(canvas, {
+          type: 'bar',
+          data: {
+            labels: labels.map(l => `Aisle ${l}`),
+            datasets: [{
+              label: 'Pallets',
+              data: data,
+              backgroundColor: 'rgba(59, 130, 246, 0.8)',
+              borderColor: 'rgba(59, 130, 246, 1)',
+              borderWidth: 2,
+              borderRadius: 8
+            }]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+              legend: { display: false },
+              title: {
+                display: true,
+                text: 'Pallets by Aisle',
+                font: { size: 16, weight: 'bold' },
+                padding: 20
+              }
+            },
+            scales: {
+              y: {
+                beginAtZero: true,
+                ticks: { stepSize: 1 }
+              }
+            }
+          }
+        });
+      },
+      
+      createActivityChart() {
+        const canvas = document.getElementById('activityChart');
+        if (!canvas) return;
+        
+        // Group activity by date (last 7 days)
+        const dates = [];
+        const checkIns = [];
+        const checkOuts = [];
+        
+        for (let i = 6; i >= 0; i--) {
+          const date = new Date();
+          date.setDate(date.getDate() - i);
+          const dateStr = date.toISOString().split('T')[0];
+          dates.push(date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }));
+          
+          const dayCheckIns = this.activityLog.filter(a => 
+            a.action === 'CHECK_IN' && a.timestamp.startsWith(dateStr)
+          ).length;
+          
+          const dayCheckOuts = this.activityLog.filter(a => 
+            (a.action === 'CHECK_OUT' || a.action === 'PARTIAL_REMOVE') && a.timestamp.startsWith(dateStr)
+          ).length;
+          
+          checkIns.push(dayCheckIns);
+          checkOuts.push(dayCheckOuts);
+        }
+        
+        this.charts.activity = new Chart(canvas, {
+          type: 'line',
+          data: {
+            labels: dates,
+            datasets: [
+              {
+                label: 'Check-ins',
+                data: checkIns,
+                borderColor: 'rgb(34, 197, 94)',
+                backgroundColor: 'rgba(34, 197, 94, 0.1)',
+                tension: 0.4,
+                fill: true,
+                borderWidth: 3
+              },
+              {
+                label: 'Check-outs',
+                data: checkOuts,
+                borderColor: 'rgb(239, 68, 68)',
+                backgroundColor: 'rgba(239, 68, 68, 0.1)',
+                tension: 0.4,
+                fill: true,
+                borderWidth: 3
+              }
+            ]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+              legend: {
+                position: 'bottom',
+                labels: {
+                  padding: 15,
+                  font: { size: 12, weight: 'bold' }
+                }
+              },
+              title: {
+                display: true,
+                text: 'Activity Last 7 Days',
+                font: { size: 16, weight: 'bold' },
+                padding: 20
+              }
+            },
+            scales: {
+              y: {
+                beginAtZero: true,
+                ticks: { stepSize: 1 }
+              }
+            }
+          }
+        });
+      },
+      
+      generateColors(count) {
+        const colors = [
+          'rgba(59, 130, 246, 0.8)',   // blue
+          'rgba(16, 185, 129, 0.8)',   // green
+          'rgba(249, 115, 22, 0.8)',   // orange
+          'rgba(139, 92, 246, 0.8)',   // purple
+          'rgba(236, 72, 153, 0.8)',   // pink
+          'rgba(234, 179, 8, 0.8)',    // yellow
+          'rgba(6, 182, 212, 0.8)',    // cyan
+          'rgba(239, 68, 68, 0.8)',    // red
+          'rgba(168, 85, 247, 0.8)',   // violet
+          'rgba(34, 197, 94, 0.8)'     // emerald
+        ];
+        
+        return Array(count).fill(0).map((_, i) => colors[i % colors.length]);
+      },
+      
+      // Google Sheets Integration
+      async syncToGoogleSheets(action, data) {
+        if (!this.googleSheetsUrl) return;
+        
+        try {
+          const response = await fetch(this.googleSheetsUrl, {
+            method: 'POST',
+            mode: 'no-cors',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              action: action,
+              ...data
+            })
+          });
+          
+          console.log('Google Sheets sync triggered:', action);
+        } catch (error) {
+          console.error('Google Sheets sync error:', error);
+        }
+      },
+      
+      async syncAllToGoogleSheets() {
+        if (!this.googleSheetsUrl) {
+          this.showToast('Please configure Google Sheets URL in Settings', 'error');
+          return;
+        }
+        
+        this.setLoading(true);
+        try {
+          await fetch(this.googleSheetsUrl, {
+            method: 'POST',
+            mode: 'no-cors',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              action: 'sync_all',
+              pallets: this.pallets
+            })
+          });
+          
+          this.showToast('Synced all inventory to Google Sheets!', 'success');
+        } catch (error) {
+          this.showToast('Error syncing to Google Sheets', 'error');
+          console.error(error);
+        } finally {
+          this.setLoading(false);
+        }
+      },
+      
+      saveGoogleSheetsUrl(url) {
+        this.googleSheetsUrl = url;
+        localStorage.setItem('googleSheetsUrl', url);
+        this.showToast('Google Sheets URL saved!', 'success');
+      },
+      
+      testGoogleSheetsConnection() {
+        if (!this.googleSheetsUrl) {
+          this.showToast('Please enter a Google Sheets URL first', 'error');
+          return;
+        }
+        
+        this.setLoading(true);
+        fetch(this.googleSheetsUrl)
+          .then(() => {
+            this.showToast('Connection successful!', 'success');
+          })
+          .catch(() => {
+            this.showToast('Connection test complete (CORS blocks response, but sync should work)', 'info');
+          })
+          .finally(() => {
+            this.setLoading(false);
+          });
+      },
+      
+      renderReports() {
+        // Calculate analytics
+        const totalQuantity = this.pallets.reduce((sum, p) => sum + p.quantity, 0);
+        const avgQuantity = this.pallets.length > 0 ? (totalQuantity / this.pallets.length).toFixed(1) : 0;
+        
+        const utilizationRate = ((this.stats.occupied_locations / this.stats.total_locations) * 100).toFixed(1);
+        
+        // Top customers by pallet count
+        const customerCounts = {};
+        this.pallets.forEach(p => {
+          customerCounts[p.customer_name] = (customerCounts[p.customer_name] || 0) + 1;
+        });
+        const topCustomers = Object.entries(customerCounts)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 5);
+        
+        // Most used locations
+        const locationCounts = {};
+        this.pallets.forEach(p => {
+          const aisle = p.location.charAt(0);
+          locationCounts[aisle] = (locationCounts[aisle] || 0) + 1;
+        });
+        const topLocations = Object.entries(locationCounts)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 5);
+        
+        // Recent activity summary
+        const last24h = this.activityLog.filter(a => {
+          const activityDate = new Date(a.timestamp);
+          const yesterday = new Date();
+          yesterday.setDate(yesterday.getDate() - 1);
+          return activityDate > yesterday;
+        }).length;
+        
+        return `
+          <div class="space-y-6 max-w-7xl mx-auto">
+            <!-- Header -->
+            <div class="flex justify-between items-center">
+              <div>
+                <h2 class="text-3xl font-bold text-gray-900 flex items-center gap-3">
+                  📊 Analytics & Reports
+                </h2>
+                <p class="text-gray-600 mt-1">Insights into your warehouse operations</p>
+              </div>
+              <button onclick="window.print()" class="bg-blue-600 text-white px-6 py-3 rounded-xl font-bold hover:bg-blue-700 shadow-lg flex items-center gap-2 print:hidden">
+                <span class="text-xl">🖨️</span> Print Report
+              </button>
+            </div>
+            
+            <!-- Key Metrics Cards -->
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+              <div class="bg-gradient-to-br from-blue-500 to-blue-600 text-white p-6 rounded-xl shadow-lg">
+                <div class="flex justify-between items-start">
+                  <div>
+                    <p class="text-blue-100 text-sm font-semibold">Total Pallets</p>
+                    <h3 class="text-4xl font-bold mt-2">${this.stats.total_pallets || 0}</h3>
+                  </div>
+                  <div class="text-5xl opacity-50">📦</div>
+                </div>
+              </div>
+              
+              <div class="bg-gradient-to-br from-green-500 to-green-600 text-white p-6 rounded-xl shadow-lg">
+                <div class="flex justify-between items-start">
+                  <div>
+                    <p class="text-green-100 text-sm font-semibold">Total Units</p>
+                    <h3 class="text-4xl font-bold mt-2">${totalQuantity}</h3>
+                  </div>
+                  <div class="text-5xl opacity-50">📊</div>
+                </div>
+              </div>
+              
+              <div class="bg-gradient-to-br from-purple-500 to-purple-600 text-white p-6 rounded-xl shadow-lg">
+                <div class="flex justify-between items-start">
+                  <div>
+                    <p class="text-purple-100 text-sm font-semibold">Space Used</p>
+                    <h3 class="text-4xl font-bold mt-2">${utilizationRate}%</h3>
+                  </div>
+                  <div class="text-5xl opacity-50">📍</div>
+                </div>
+              </div>
+              
+              <div class="bg-gradient-to-br from-orange-500 to-orange-600 text-white p-6 rounded-xl shadow-lg">
+                <div class="flex justify-between items-start">
+                  <div>
+                    <p class="text-orange-100 text-sm font-semibold">24h Activity</p>
+                    <h3 class="text-4xl font-bold mt-2">${last24h}</h3>
+                  </div>
+                  <div class="text-5xl opacity-50">⚡</div>
+                </div>
+              </div>
+            </div>
+            
+            <!-- Charts Row -->
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              <div class="bg-white p-6 rounded-xl shadow-lg border border-gray-200">
+                <div style="height: 300px;">
+                  <canvas id="customerChart"></canvas>
+                </div>
+              </div>
+              
+              <div class="bg-white p-6 rounded-xl shadow-lg border border-gray-200">
+                <div style="height: 300px;">
+                  <canvas id="locationChart"></canvas>
+                </div>
+              </div>
+            </div>
+            
+            <!-- Activity Chart -->
+            <div class="bg-white p-6 rounded-xl shadow-lg border border-gray-200">
+              <div style="height: 300px;">
+                <canvas id="activityChart"></canvas>
+              </div>
+            </div>
+            
+            <!-- Top Lists -->
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              <!-- Top Customers -->
+              <div class="bg-white p-6 rounded-xl shadow-lg border border-gray-200">
+                <h3 class="text-xl font-bold text-gray-900 mb-4 flex items-center gap-2">
+                  <span class="text-2xl">👥</span> Top Customers
+                </h3>
+                <div class="space-y-3">
+                  ${topCustomers.length === 0 ? 
+                    '<p class="text-gray-500 text-center py-8">No customer data yet</p>' :
+                    topCustomers.map((c, i) => `
+                      <div class="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
+                        <div class="flex items-center gap-3">
+                          <div class="w-8 h-8 rounded-full bg-blue-600 text-white flex items-center justify-center font-bold">
+                            ${i + 1}
+                          </div>
+                          <span class="font-semibold text-gray-900">${c[0]}</span>
+                        </div>
+                        <span class="bg-blue-100 text-blue-700 px-3 py-1 rounded-full font-bold text-sm">
+                          ${c[1]} pallets
+                        </span>
+                      </div>
+                    `).join('')
+                  }
+                </div>
+              </div>
+              
+              <!-- Busiest Aisles -->
+              <div class="bg-white p-6 rounded-xl shadow-lg border border-gray-200">
+                <h3 class="text-xl font-bold text-gray-900 mb-4 flex items-center gap-2">
+                  <span class="text-2xl">📍</span> Busiest Aisles
+                </h3>
+                <div class="space-y-3">
+                  ${topLocations.length === 0 ? 
+                    '<p class="text-gray-500 text-center py-8">No location data yet</p>' :
+                    topLocations.map((l, i) => `
+                      <div class="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
+                        <div class="flex items-center gap-3">
+                          <div class="w-8 h-8 rounded-full bg-purple-600 text-white flex items-center justify-center font-bold">
+                            ${i + 1}
+                          </div>
+                          <span class="font-semibold text-gray-900">Aisle ${l[0]}</span>
+                        </div>
+                        <span class="bg-purple-100 text-purple-700 px-3 py-1 rounded-full font-bold text-sm">
+                          ${l[1]} pallets
+                        </span>
+                      </div>
+                    `).join('')
+                  }
+                </div>
+              </div>
+            </div>
+            
+            <!-- Summary Stats -->
+            <div class="bg-gradient-to-r from-gray-50 to-gray-100 p-6 rounded-xl border border-gray-200">
+              <h3 class="text-xl font-bold text-gray-900 mb-4">📈 Summary Statistics</h3>
+              <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                <div class="text-center">
+                  <p class="text-gray-600 text-sm font-semibold">Avg Quantity/Pallet</p>
+                  <p class="text-3xl font-bold text-gray-900 mt-1">${avgQuantity}</p>
+                </div>
+                <div class="text-center">
+                  <p class="text-gray-600 text-sm font-semibold">Active Customers</p>
+                  <p class="text-3xl font-bold text-gray-900 mt-1">${this.customers.length}</p>
+                </div>
+                <div class="text-center">
+                  <p class="text-gray-600 text-sm font-semibold">Available Spaces</p>
+                  <p class="text-3xl font-bold text-gray-900 mt-1">${this.stats.total_locations - this.stats.occupied_locations}</p>
+                </div>
+                <div class="text-center">
+                  <p class="text-gray-600 text-sm font-semibold">Total Activities</p>
+                  <p class="text-3xl font-bold text-gray-900 mt-1">${this.activityLog.length}</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        `;
+      },
+      
+      renderSettings() {
+        return `
+          <div class="max-w-2xl mx-auto space-y-6">
+            <div>
+              <h2 class="text-3xl font-bold text-gray-900 flex items-center gap-3 mb-2">
+                ⚙️ Settings
+              </h2>
+              <p class="text-gray-600">Configure Google Sheets integration and other options</p>
+            </div>
+            
+            <!-- Google Sheets Integration -->
+            <div class="bg-white p-6 rounded-xl shadow-lg border border-gray-200">
+              <div class="flex items-start gap-4 mb-4">
+                <div class="text-4xl">📊</div>
+                <div class="flex-1">
+                  <h3 class="text-xl font-bold text-gray-900 mb-2">Google Sheets Integration</h3>
+                  <p class="text-gray-600 text-sm mb-4">
+                    Automatically sync inventory to Google Sheets for customer access
+                  </p>
+                  
+                  <div class="space-y-3">
+                    <div>
+                      <label class="block text-sm font-semibold text-gray-700 mb-2">
+                        Google Apps Script Web App URL
+                      </label>
+                      <input 
+                        type="text" 
+                        id="google-sheets-url"
+                        value="${this.googleSheetsUrl}"
+                        placeholder="https://script.google.com/macros/s/..."
+                        class="w-full border-2 border-gray-300 p-3 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 font-mono"
+                        onchange="app.saveGoogleSheetsUrl(this.value)"
+                      />
+                      <p class="text-xs text-gray-500 mt-2">
+                        Paste the Web App URL from your Google Apps Script deployment
+                      </p>
+                    </div>
+                    
+                    <div class="flex gap-2">
+                      <button 
+                        onclick="app.testGoogleSheetsConnection()" 
+                        class="bg-gray-500 text-white px-4 py-2 rounded-lg font-semibold hover:bg-gray-600 text-sm"
+                      >
+                        Test Connection
+                      </button>
+                      <button 
+                        onclick="app.syncAllToGoogleSheets()" 
+                        class="bg-blue-600 text-white px-4 py-2 rounded-lg font-semibold hover:bg-blue-700 text-sm flex items-center gap-2"
+                      >
+                        <span>🔄</span> Sync All Inventory Now
+                      </button>
+                    </div>
+                    
+                    ${this.googleSheetsUrl ? `
+                      <div class="bg-green-50 border border-green-200 p-3 rounded-lg">
+                        <p class="text-sm text-green-800 flex items-center gap-2">
+                          <span class="text-lg">✓</span> 
+                          Auto-sync is <strong>enabled</strong> - Changes sync automatically
+                        </p>
+                      </div>
+                    ` : `
+                      <div class="bg-yellow-50 border border-yellow-200 p-3 rounded-lg">
+                        <p class="text-sm text-yellow-800 flex items-center gap-2">
+                          <span class="text-lg">⚠️</span> 
+                          Auto-sync is <strong>disabled</strong> - Add URL to enable
+                        </p>
+                      </div>
+                    `}
+                  </div>
+                </div>
+              </div>
+            </div>
+            
+            <!-- Setup Instructions -->
+            <div class="bg-blue-50 border-l-4 border-blue-500 p-6 rounded-r-xl">
+              <h4 class="font-bold text-blue-900 mb-3 text-lg">📖 Quick Setup Guide</h4>
+              <ol class="space-y-3 text-sm text-blue-800">
+                <li class="flex gap-3">
+                  <span class="font-bold flex-shrink-0">1.</span>
+                  <span>Create a new Google Sheet with headers: <code class="bg-blue-100 px-2 py-1 rounded">Customer | Product ID | Quantity | Location | Date Added</code></span>
+                </li>
+                <li class="flex gap-3">
+                  <span class="font-bold flex-shrink-0">2.</span>
+                  <span>Go to <strong>Extensions → Apps Script</strong> in your Google Sheet</span>
+                </li>
+                <li class="flex gap-3">
+                  <span class="font-bold flex-shrink-0">3.</span>
+                  <span>Copy the script code from the artifact I provided</span>
+                </li>
+                <li class="flex gap-3">
+                  <span class="font-bold flex-shrink-0">4.</span>
+                  <span>Click <strong>Deploy → New Deployment → Web app</strong></span>
+                </li>
+                <li class="flex gap-3">
+                  <span class="font-bold flex-shrink-0">5.</span>
+                  <span>Set "Who has access" to <strong>Anyone</strong> and click Deploy</span>
+                </li>
+                <li class="flex gap-3">
+                  <span class="font-bold flex-shrink-0">6.</span>
+                  <span>Copy the Web App URL and paste it above</span>
+                </li>
+                <li class="flex gap-3">
+                  <span class="font-bold flex-shrink-0">7.</span>
+                  <span>Click "Sync All Inventory Now" to do initial sync</span>
+                </li>
+              </ol>
+            </div>
+            
+            <!-- Info -->
+            <div class="bg-gradient-to-r from-gray-50 to-gray-100 p-6 rounded-xl border border-gray-200">
+              <h4 class="font-bold text-gray-900 mb-2">💡 How It Works</h4>
+              <ul class="space-y-2 text-sm text-gray-700">
+                <li class="flex gap-2">
+                  <span>✓</span>
+                  <span>Every check-in/check-out automatically updates your Google Sheet</span>
+                </li>
+                <li class="flex gap-2">
+                  <span>✓</span>
+                  <span>Share the Google Sheet with customers (View Only access)</span>
+                </li>
+                <li class="flex gap-2">
+                  <span>✓</span>
+                  <span>Customers can see real-time inventory without warehouse access</span>
+                </li>
+                <li class="flex gap-2">
+                  <span>✓</span>
+                  <span>Use "Sync All" button to refresh if data gets out of sync</span>
+                </li>
+              </ul>
+            </div>
+          </div>
+        `;
+      },
+      
       async filterByCustomer(customer) {
         this.selectedCustomer = customer;
         this.searchTerm = '';
@@ -850,26 +1505,38 @@
             <button onclick="app.view='inventory'; app.render()" class="flex-1 py-4 text-sm font-semibold ${this.view === 'inventory' ? 'bg-blue-50 text-blue-600 border-b-2 border-blue-600' : 'text-gray-600 hover:bg-gray-50'}">
               📋 Inventory
             </button>
+            <button onclick="app.view='reports'; app.render()" class="flex-1 py-4 text-sm font-semibold ${this.view === 'reports' ? 'bg-blue-50 text-blue-600 border-b-2 border-blue-600' : 'text-gray-600 hover:bg-gray-50'}">
+              📊 Reports
+            </button>
             <button onclick="app.view='qr-generator'; app.render()" class="flex-1 py-4 text-sm font-semibold ${this.view === 'qr-generator' ? 'bg-blue-50 text-blue-600 border-b-2 border-blue-600' : 'text-gray-600 hover:bg-gray-50'}">
-              🏷️ QR Codes
+              🏷️ QR
             </button>
             <button onclick="app.view='history'; app.render()" class="flex-1 py-4 text-sm font-semibold ${this.view === 'history' ? 'bg-blue-50 text-blue-600 border-b-2 border-blue-600' : 'text-gray-600 hover:bg-gray-50'}">
               📜 History
+            </button>
+            <button onclick="app.view='settings'; app.render()" class="flex-1 py-4 text-sm font-semibold ${this.view === 'settings' ? 'bg-blue-50 text-blue-600 border-b-2 border-blue-600' : 'text-gray-600 hover:bg-gray-50'}">
+              ⚙️ Settings
             </button>
           </div>
           
           <div class="p-4 fade-in">
             ${this.view === 'scan' ? this.renderScan() : 
               this.view === 'inventory' ? this.renderInventory(filtered) :
+              this.view === 'reports' ? this.renderReports() :
               this.view === 'qr-generator' ? this.renderQRGenerator() :
               this.view === 'location-qrs' ? this.renderLocationQRs() :
               this.view === 'single-qr' ? this.renderSingleQR() :
+              this.view === 'settings' ? this.renderSettings() :
               this.renderHistory()}
           </div>
         `;
         
         if (this.view === 'inventory') {
           this.attachSearchListener();
+        }
+        
+        if (this.view === 'reports') {
+          setTimeout(() => this.initCharts(), 100);
         }
       },
       
