@@ -39,6 +39,7 @@ db.serialize(() => {
       const hasPalletQuantity = columns.some(
         (col) => col.name === "pallet_quantity",
       );
+      const hasParts = columns.some((col) => col.name === "parts");
 
       if (hasQuantity && !hasPalletQuantity) {
         console.log("🔄 Migrating database to new schema...");
@@ -60,6 +61,14 @@ db.serialize(() => {
           console.log("✓ Migration complete");
         }, 500);
       }
+
+      if (!hasParts) {
+        console.log("🔄 Adding parts column...");
+        db.run("ALTER TABLE pallets ADD COLUMN parts TEXT", (err) => {
+          if (err) console.error("Error adding parts column:", err);
+          else console.log("✓ Parts column added");
+        });
+      }
     }
   });
 
@@ -72,6 +81,7 @@ db.serialize(() => {
     pallet_quantity INTEGER DEFAULT 1,
     product_quantity INTEGER DEFAULT 0,
     location TEXT NOT NULL,
+    parts TEXT,
     date_added DATETIME DEFAULT CURRENT_TIMESTAMP,
     date_removed DATETIME,
     status TEXT DEFAULT 'active'
@@ -167,7 +177,14 @@ app.get("/api/pallets", (req, res) => {
 
   db.all(query, params, (err, rows) => {
     if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
+    
+    // Parse parts JSON for each row
+    const palletsWithParts = rows.map(row => ({
+      ...row,
+      parts: row.parts ? JSON.parse(row.parts) : null
+    }));
+    
+    res.json(palletsWithParts);
   });
 });
 
@@ -179,7 +196,14 @@ app.get("/api/pallets/search", (req, res) => {
     [`%${q}%`, `%${q}%`, `%${q}%`],
     (err, rows) => {
       if (err) return res.status(500).json({ error: err.message });
-      res.json(rows);
+      
+      // Parse parts JSON for each row
+      const palletsWithParts = rows.map(row => ({
+        ...row,
+        parts: row.parts ? JSON.parse(row.parts) : null
+      }));
+      
+      res.json(palletsWithParts);
     }
   );
 });
@@ -193,6 +217,7 @@ app.post("/api/pallets", (req, res) => {
     pallet_quantity,
     product_quantity,
     location,
+    parts,
   } = req.body;
 
   if (!customer_name || !product_id || !location) {
@@ -202,9 +227,10 @@ app.post("/api/pallets", (req, res) => {
   }
 
   const palletId = id || `PLT-${Date.now()}`;
+  const partsJson = parts ? JSON.stringify(parts) : null;
 
   db.run(
-    "INSERT INTO pallets (id, customer_name, product_id, pallet_quantity, product_quantity, location) VALUES (?, ?, ?, ?, ?, ?)",
+    "INSERT INTO pallets (id, customer_name, product_id, pallet_quantity, product_quantity, location, parts) VALUES (?, ?, ?, ?, ?, ?, ?)",
     [
       palletId,
       customer_name,
@@ -212,6 +238,7 @@ app.post("/api/pallets", (req, res) => {
       pallet_quantity || 1,
       product_quantity || 0,
       location,
+      partsJson,
     ],
     function (err) {
       if (err) return res.status(500).json({ error: err.message });
@@ -239,6 +266,7 @@ app.post("/api/pallets", (req, res) => {
         pallet_quantity: pallet_quantity || 1,
         product_quantity: product_quantity || 0,
         location,
+        parts: parts || null,
         message: "Pallet checked in successfully",
       });
     },
@@ -337,6 +365,124 @@ app.post("/api/pallets/:id/remove-quantity", (req, res) => {
             });
           },
         );
+      }
+    }
+  );
+});
+
+// Remove partial units from pallet (NEW FEATURE)
+app.post("/api/pallets/:id/remove-units", (req, res) => {
+  const { id } = req.params;
+  const { units_to_remove } = req.body;
+
+  if (!units_to_remove || units_to_remove <= 0) {
+    return res.status(400).json({ error: "Valid unit quantity required" });
+  }
+
+  db.get(
+    'SELECT * FROM pallets WHERE (id = ? OR product_id = ?) AND status = "active"',
+    [id, id],
+    (err, row) => {
+      if (err) return res.status(500).json({ error: err.message });
+      if (!row) return res.status(404).json({ error: "Pallet not found" });
+
+      if (!row.product_quantity || row.product_quantity === 0) {
+        return res.status(400).json({ 
+          error: "This pallet does not track individual units. Use remove-quantity endpoint instead." 
+        });
+      }
+
+      const totalUnits = row.pallet_quantity * row.product_quantity;
+      const unitsAfter = totalUnits - units_to_remove;
+
+      if (unitsAfter < 0) {
+        return res.status(400).json({ 
+          error: `Cannot remove ${units_to_remove} units. Only ${totalUnits} units available.` 
+        });
+      }
+
+      // Calculate new pallet quantity
+      const newPalletQuantity = Math.ceil(unitsAfter / row.product_quantity);
+      const remainingUnitsOnLastPallet = unitsAfter % row.product_quantity;
+
+      if (unitsAfter === 0) {
+        // Remove entire pallet if all units are removed
+        db.run(
+          'UPDATE pallets SET status = "removed", date_removed = CURRENT_TIMESTAMP, pallet_quantity = 0, product_quantity = 0 WHERE id = ?',
+          [row.id],
+          (err) => {
+            if (err) return res.status(500).json({ error: err.message });
+
+            db.run("UPDATE locations SET is_occupied = 0 WHERE id = ?", [row.location]);
+
+            // Log activity
+            db.run(
+              "INSERT INTO activity_log (pallet_id, customer_name, product_id, action, quantity_changed, quantity_before, quantity_after, location, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              [
+                row.id,
+                row.customer_name,
+                row.product_id,
+                "UNITS_REMOVE",
+                units_to_remove,
+                totalUnits,
+                0,
+                row.location,
+                "All units removed. Pallet cleared.",
+              ],
+            );
+
+            res.json({
+              message: "All units removed. Location freed.",
+              units_removed: units_to_remove,
+              units_remaining: 0,
+              pallets_remaining: 0,
+              pallet_removed: true,
+            });
+          },
+        );
+      } else {
+        // Update pallet quantity (and potentially product_quantity for partial pallet)
+        let updateQuery, updateParams;
+        
+        if (remainingUnitsOnLastPallet === 0) {
+          // Clean division - all pallets are full
+          updateQuery = "UPDATE pallets SET pallet_quantity = ? WHERE id = ?";
+          updateParams = [newPalletQuantity, row.id];
+        } else {
+          // Partial pallet - need to track this differently
+          // Keep full pallets + partial pallet
+          updateQuery = "UPDATE pallets SET pallet_quantity = ? WHERE id = ?";
+          updateParams = [newPalletQuantity, row.id];
+        }
+
+        db.run(updateQuery, updateParams, (err) => {
+          if (err) return res.status(500).json({ error: err.message });
+
+          // Log activity
+          db.run(
+            "INSERT INTO activity_log (pallet_id, customer_name, product_id, action, quantity_changed, quantity_before, quantity_after, location, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+              row.id,
+              row.customer_name,
+              row.product_id,
+              "UNITS_REMOVE",
+              units_to_remove,
+              totalUnits,
+              unitsAfter,
+              row.location,
+              `Removed ${units_to_remove} units. ${unitsAfter} units (${newPalletQuantity} pallets) remaining.`,
+            ],
+          );
+
+          res.json({
+            message: `Removed ${units_to_remove} units. ${unitsAfter} units remaining across ${newPalletQuantity} pallet(s).`,
+            units_removed: units_to_remove,
+            units_remaining: unitsAfter,
+            pallets_remaining: newPalletQuantity,
+            units_per_pallet: row.product_quantity,
+            pallet_removed: false,
+          });
+        });
       }
     }
   );
