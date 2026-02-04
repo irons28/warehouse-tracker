@@ -287,8 +287,8 @@ const app = {
     }
   },
   
-  // ENHANCED: Check in with support for multiple parts per pallet
-  async checkIn(customerName, productId, palletQuantity, productQuantity, location, parts = null) {
+  // ENHANCED: Check in with support for multiple parts per pallet and scanned by tracking
+  async checkIn(customerName, productId, palletQuantity, productQuantity, location, parts = null, scannedBy = 'Unknown') {
     this.setLoading(true);
     try {
       const payload = { 
@@ -296,7 +296,8 @@ const app = {
         product_id: productId, 
         pallet_quantity: palletQuantity,
         product_quantity: productQuantity,
-        location 
+        location,
+        scanned_by: scannedBy
       };
       
       // Add parts list if provided
@@ -310,7 +311,7 @@ const app = {
         body: JSON.stringify(payload)
       });
       const data = await res.json();
-      this.showToast(data.message || 'Pallet checked in successfully!', 'success');
+      this.showToast(data.message || `Checked in by ${scannedBy}`, 'success');
       
       if (this.googleSheetsUrl) {
         await this.syncToGoogleSheets('add_pallet', {
@@ -318,8 +319,10 @@ const app = {
           product_id: productId,
           pallet_quantity: palletQuantity,
           product_quantity: productQuantity,
+          current_units: productQuantity, // Starts at full capacity
           location: location,
           parts: parts,
+          scanned_by: scannedBy,
           date_added: new Date().toISOString()
         });
       }
@@ -337,23 +340,36 @@ const app = {
     }
   },
   
-  async checkOut(palletId) {
-    const confirmed = await this.confirm('Remove Pallet', 'Are you sure you want to remove this entire pallet from inventory?');
-    if (!confirmed) return;
+  async checkOut(palletId, scannedBy = null, skipConfirm = false) {
+    if (!skipConfirm) {
+      const confirmed = await this.confirm('Remove Pallet', 'Are you sure you want to remove this entire pallet from inventory?');
+      if (!confirmed) return;
+    }
     
     const pallet = this.pallets.find(p => p.id === palletId);
     
+    // If scannedBy not provided, ask for it
+    if (scannedBy === null) {
+      const input = await this.prompt('Scanned By', 'Who is checking out this pallet?', '');
+      scannedBy = input?.trim() || 'Unknown';
+    }
+    
     this.setLoading(true);
     try {
-      const res = await fetch(`${API_URL}/api/pallets/${palletId}`, { method: 'DELETE' });
+      const res = await fetch(`${API_URL}/api/pallets/${palletId}`, { 
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scanned_by: scannedBy })
+      });
       const data = await res.json();
-      this.showToast(data.message || 'Pallet checked out successfully!', 'success');
+      this.showToast(data.message || `Checked out by ${scannedBy}`, 'success');
       
       if (this.googleSheetsUrl && pallet) {
         await this.syncToGoogleSheets('remove_pallet', {
           customer_name: pallet.customer_name,
           product_id: pallet.product_id,
-          location: pallet.location
+          location: pallet.location,
+          scanned_by: scannedBy
         });
       }
       
@@ -370,7 +386,7 @@ const app = {
   },
   
   // ENHANCED: Remove partial pallets
-  async removePartialQuantity(palletId) {
+  async removePartialQuantity(palletId, qtyToRemove = null, scannedBy = null) {
     const pallet = this.pallets.find(p => p.id === palletId);
     if (!pallet) {
       this.showToast('Pallet not found', 'error');
@@ -385,15 +401,19 @@ const app = {
       total_units: pallet.pallet_quantity * pallet.product_quantity
     });
     
-    const qtyToRemove = await this.prompt(
-      'Remove Pallets',
-      `Current pallet quantity: <strong>${pallet.pallet_quantity}</strong><br><br>How many pallets to remove?`,
-      '1'
-    );
+    // If quantity not provided, ask for it
+    if (qtyToRemove === null) {
+      const input = await this.prompt(
+        'Remove Pallets',
+        `Current pallet quantity: <strong>${pallet.pallet_quantity}</strong><br><br>How many pallets to remove?`,
+        '1'
+      );
+      
+      if (input === null) return;
+      qtyToRemove = parseInt(input);
+    }
     
-    if (qtyToRemove === null) return;
-    
-    const qty = parseInt(qtyToRemove);
+    const qty = qtyToRemove;
     if (isNaN(qty) || qty <= 0) {
       this.showToast('Please enter a valid quantity', 'error');
       return;
@@ -404,14 +424,20 @@ const app = {
       return;
     }
     
+    // If scannedBy not provided, ask for it
+    if (scannedBy === null) {
+      const input = await this.prompt('Scanned By', 'Who is removing these pallets?', '');
+      scannedBy = input?.trim() || 'Unknown';
+    }
+    
     this.setLoading(true);
     try {
       console.log('===== STARTING PALLET REMOVAL =====');
-      console.log('Removing pallets:', qty, 'from pallet:', pallet.id);
+      console.log('Removing pallets:', qty, 'from pallet:', pallet.id, 'by:', scannedBy);
       const res = await fetch(`${API_URL}/api/pallets/${palletId}/remove-quantity`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ quantity_to_remove: qty })
+        body: JSON.stringify({ quantity_to_remove: qty, scanned_by: scannedBy })
       });
       
       if (!res.ok) {
@@ -422,7 +448,7 @@ const app = {
       const data = await res.json();
       console.log('===== SERVER RESPONSE =====');
       console.log('Full response:', data);
-      this.showToast(data.message || 'Pallets removed successfully!', 'success');
+      this.showToast(data.message || `Removed by ${scannedBy}`, 'success');
       
       if (this.googleSheetsUrl) {
         console.log('===== SYNCING TO GOOGLE SHEETS =====');
@@ -431,14 +457,16 @@ const app = {
           await this.syncToGoogleSheets('remove_pallet', {
             customer_name: pallet.customer_name,
             product_id: pallet.product_id,
-            location: pallet.location
+            location: pallet.location,
+            scanned_by: scannedBy
           });
         } else {
           await this.syncToGoogleSheets('update_quantity', {
             customer_name: pallet.customer_name,
             product_id: pallet.product_id,
             location: pallet.location,
-            new_quantity: newQuantity
+            new_quantity: newQuantity,
+            scanned_by: scannedBy
           });
         }
         console.log('Google Sheets sync complete');
@@ -485,7 +513,7 @@ const app = {
   },
   
   // NEW: Remove partial units from pallet (for individual parts/items)
-  async removePartialUnits(palletId) {
+  async removePartialUnits(palletId, unitsToRemove = null, scannedBy = null) {
     const pallet = this.pallets.find(p => p.id === palletId || p.product_id === palletId);
     if (!pallet) {
       this.showToast('Pallet not found', 'error');
@@ -509,20 +537,24 @@ const app = {
       total_units: totalUnits
     });
     
-    const unitsToRemove = await this.prompt(
-      'Remove Units',
-      `<div class="space-y-2">
-        <p><strong>Original Capacity:</strong> ${pallet.product_quantity} units/pallet</p>
-        <p><strong>Current Units:</strong> ${currentUnits} units (${pallet.pallet_quantity} pallet${pallet.pallet_quantity > 1 ? 's' : ''})</p>
-        <p class="font-bold text-lg">Available: ${totalUnits} total units</p>
-      </div>
-      <p class="mt-3">How many units to remove?</p>`,
-      '1'
-    );
+    // If unitsToRemove not provided, ask for it
+    if (unitsToRemove === null) {
+      const input = await this.prompt(
+        'Remove Units',
+        `<div class="space-y-2">
+          <p><strong>Original Capacity:</strong> ${pallet.product_quantity} units/pallet</p>
+          <p><strong>Current Units:</strong> ${currentUnits} units (${pallet.pallet_quantity} pallet${pallet.pallet_quantity > 1 ? 's' : ''})</p>
+          <p class="font-bold text-lg">Available: ${totalUnits} total units</p>
+        </div>
+        <p class="mt-3">How many units to remove?</p>`,
+        '1'
+      );
+      
+      if (input === null) return;
+      unitsToRemove = parseInt(input);
+    }
     
-    if (unitsToRemove === null) return;
-    
-    const units = parseInt(unitsToRemove);
+    const units = unitsToRemove;
     if (isNaN(units) || units <= 0) {
       this.showToast('Please enter a valid quantity', 'error');
       return;
@@ -533,15 +565,24 @@ const app = {
       return;
     }
     
+    // If scannedBy not provided, ask for it
+    if (scannedBy === null) {
+      const input = await this.prompt('Scanned By', 'Who is removing these units?', '');
+      scannedBy = input?.trim() || 'Unknown';
+    }
+    
     this.setLoading(true);
     try {
       console.log('===== STARTING UNIT REMOVAL =====');
-      console.log('Removing units:', units, 'from pallet:', pallet.id);
+      console.log('Removing units:', units, 'from pallet:', pallet.id, 'by:', scannedBy);
       
       const res = await fetch(`${API_URL}/api/pallets/${pallet.id}/remove-units`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ units_to_remove: units })
+        body: JSON.stringify({ 
+          units_to_remove: units,
+          scanned_by: scannedBy
+        })
       });
       
       if (!res.ok) {
@@ -571,14 +612,15 @@ const app = {
             location: pallet.location,
             units_removed: units,
             new_pallet_quantity: newPalletQty,
-            units_per_pallet: pallet.product_quantity
+            units_per_pallet: pallet.product_quantity,
+            scanned_by: scannedBy
           });
         }
         console.log('Google Sheets sync complete');
       }
       
       // Show success message
-      this.showToast(data.message || 'Units removed successfully!', 'success');
+      this.showToast(data.message || `Removed by ${scannedBy}`, 'success');
       
       // Force reload with delay and cache busting
       console.log('===== RELOADING DATA =====');
@@ -649,7 +691,7 @@ const app = {
       (a.action === 'PARTIAL_REMOVE' || a.action === 'UNITS_REMOVE')
     );
     
-    const totalUnits = pallet.pallet_quantity * pallet.product_quantity;
+    const totalUnits = pallet.current_units || (pallet.pallet_quantity * pallet.product_quantity);
     
     const content = `
       <div class="space-y-4">
@@ -675,13 +717,17 @@ const app = {
             </div>
             ${pallet.product_quantity > 0 ? `
               <div class="col-span-2">
-                <span class="text-gray-600">Total Units:</span>
+                <span class="text-gray-600">Current Units:</span>
                 <span class="font-bold ml-2 text-blue-600">${totalUnits}</span>
               </div>
             ` : ''}
             <div class="col-span-2">
               <span class="text-gray-600">Date Added:</span>
               <span class="font-semibold ml-2">${new Date(pallet.date_added).toLocaleString()}</span>
+            </div>
+            <div class="col-span-2">
+              <span class="text-gray-600">Scanned In By:</span>
+              <span class="font-bold ml-2 text-green-600">👤 ${pallet.scanned_by || 'Unknown'}</span>
             </div>
           </div>
           
@@ -710,7 +756,7 @@ const app = {
                 <div class="bg-red-50 p-3 rounded-lg border border-red-200 text-sm">
                   <div class="flex justify-between items-start mb-1">
                     <span class="font-semibold text-red-700">${r.action === 'UNITS_REMOVE' ? 'Units Removed' : 'Pallets Removed'}</span>
-                    <span class="text-xs text-gray-500">${new Date(r.timestamp).toLocaleDateString()}</span>
+                    <span class="text-xs text-gray-500">${new Date(r.timestamp).toLocaleString()}</span>
                   </div>
                   <div class="grid grid-cols-3 gap-2 text-xs mt-2">
                     <div>
@@ -725,6 +771,10 @@ const app = {
                       <span class="text-gray-600">After:</span>
                       <span class="font-semibold ml-1">${r.quantity_after}</span>
                     </div>
+                  </div>
+                  <div class="mt-2 pt-2 border-t border-red-100">
+                    <span class="text-xs text-gray-600">Removed by:</span>
+                    <span class="text-xs font-bold text-red-700 ml-1">👤 ${r.scanned_by || 'Unknown'}</span>
                   </div>
                   ${r.notes ? `<p class="text-xs text-gray-600 mt-2 italic">${r.notes}</p>` : ''}
                 </div>
@@ -798,73 +848,162 @@ const app = {
   },
   
   async handleScan(code) {
+    // Try to parse as JSON (new pallet QR with embedded data)
+    let palletData = null;
+    try {
+      const parsed = JSON.parse(code);
+      if (parsed.type === 'PALLET') {
+        palletData = parsed;
+      }
+    } catch (e) {
+      // Not JSON, treat as simple ID
+    }
+    
     if (this.scanMode === 'checkin-pallet') {
-      this.tempPallet = code;
+      this.tempPallet = palletData || code;
       this.stopScanner();
       this.showToast('Pallet scanned! Now scan location...', 'success');
       setTimeout(() => {
         this.scanMode = 'checkin-location';
         this.startScanner('checkin-location');
       }, 500);
+      
     } else if (this.scanMode === 'checkin-location') {
       this.stopScanner();
-      const customerName = await this.prompt('Customer Name', 'Enter customer name:');
-      if (!customerName) {
-        this.scanMode = null;
-        this.tempPallet = null;
-        this.render();
-        return;
-      }
       
-      const palletQty = await this.prompt('Pallet Quantity', 'How many pallets?', '1');
-      if (palletQty === null) {
-        this.scanMode = null;
-        this.tempPallet = null;
-        this.render();
-        return;
-      }
-      
-      const productQty = await this.prompt('Product Quantity (Optional)', 'Units per pallet (leave blank if not tracking):', '0');
-      if (productQty === null) {
-        this.scanMode = null;
-        this.tempPallet = null;
-        this.render();
-        return;
-      }
-      
-      // NEW: Ask if they want to add a parts list
-      const addParts = await this.confirm('Add Parts List', 'Would you like to add a detailed parts list for this pallet?');
-      let parts = null;
-      
-      if (addParts) {
-        const partsList = await this.promptMultiline(
-          'Parts List',
-          'Enter parts for this pallet (one per line):',
-          ''
-        );
-        
-        if (partsList && partsList.trim()) {
-          parts = this.parsePartsList(partsList);
+      // If we have full pallet data from QR, just ask for "scanned by"
+      if (this.tempPallet && typeof this.tempPallet === 'object' && this.tempPallet.customer) {
+        const scannedBy = await this.prompt('Scanned By', 'Who is checking in this pallet?', '');
+        if (scannedBy === null) {
+          this.scanMode = null;
+          this.tempPallet = null;
+          this.render();
+          return;
         }
+        
+        // Use all data from QR code
+        this.checkIn(
+          this.tempPallet.customer, 
+          this.tempPallet.product, 
+          this.tempPallet.palletQty, 
+          this.tempPallet.productQty, 
+          code, // location
+          this.tempPallet.parts,
+          scannedBy.trim() || 'Unknown'
+        );
+        this.scanMode = null;
+        this.tempPallet = null;
+        
+      } else {
+        // Old workflow - ask for all details
+        const customerName = await this.prompt('Customer Name', 'Enter customer name:');
+        if (!customerName) {
+          this.scanMode = null;
+          this.tempPallet = null;
+          this.render();
+          return;
+        }
+        
+        const palletQty = await this.prompt('Pallet Quantity', 'How many pallets?', '1');
+        if (palletQty === null) {
+          this.scanMode = null;
+          this.tempPallet = null;
+          this.render();
+          return;
+        }
+        
+        const productQty = await this.prompt('Product Quantity (Optional)', 'Units per pallet (leave blank if not tracking):', '0');
+        if (productQty === null) {
+          this.scanMode = null;
+          this.tempPallet = null;
+          this.render();
+          return;
+        }
+        
+        const addParts = await this.confirm('Add Parts List', 'Would you like to add a detailed parts list for this pallet?');
+        let parts = null;
+        
+        if (addParts) {
+          const partsList = await this.promptMultiline(
+            'Parts List',
+            'Enter parts for this pallet (one per line):',
+            ''
+          );
+          
+          if (partsList && partsList.trim()) {
+            parts = this.parsePartsList(partsList);
+          }
+        }
+        
+        const scannedBy = await this.prompt('Scanned By', 'Who is checking in this pallet?', '');
+        
+        this.checkIn(customerName, this.tempPallet, parseInt(palletQty) || 1, parseInt(productQty) || 0, code, parts, scannedBy?.trim() || 'Unknown');
+        this.scanMode = null;
+        this.tempPallet = null;
       }
       
-      this.checkIn(customerName, this.tempPallet, parseInt(palletQty) || 1, parseInt(productQty) || 0, code, parts);
-      this.scanMode = null;
-      this.tempPallet = null;
     } else if (this.scanMode === 'checkout') {
       this.stopScanner();
-      this.checkOut(code);
-      this.scanMode = null;
-    } else if (this.scanMode === 'checkout-units') {
-      this.stopScanner();
-      this.tempCheckoutUnits = code;
+      
+      // Parse pallet data if it's a JSON QR
+      const palletId = palletData ? palletData.id : code;
       
       // Find the pallet
-      const pallet = this.pallets.find(p => p.id === code || p.product_id === code);
+      const pallet = this.pallets.find(p => p.id === palletId || p.product_id === palletId);
       if (!pallet) {
         this.showToast('Pallet not found in inventory', 'error');
         this.scanMode = null;
-        this.tempCheckoutUnits = null;
+        this.render();
+        return;
+      }
+      
+      // Ask for pallet quantity to remove
+      const qtyToRemove = await this.prompt(
+        'Check Out Pallets',
+        `<div class="mb-3">
+          <p class="font-bold text-lg mb-2">${pallet.product_id}</p>
+          <p class="text-sm text-gray-600">Customer: ${pallet.customer_name}</p>
+          <p class="text-sm text-gray-600">Location: ${pallet.location}</p>
+          <p class="text-sm font-semibold mt-2">Available: ${pallet.pallet_quantity} pallet(s)</p>
+        </div>
+        <p class="font-semibold">How many pallets to check out?</p>`,
+        pallet.pallet_quantity.toString()
+      );
+      
+      if (qtyToRemove === null) {
+        this.scanMode = null;
+        return;
+      }
+      
+      // Ask who is checking out
+      const scannedBy = await this.prompt('Scanned By', 'Who is checking out this pallet?', '');
+      if (scannedBy === null) {
+        this.scanMode = null;
+        return;
+      }
+      
+      const qty = parseInt(qtyToRemove);
+      if (qty >= pallet.pallet_quantity) {
+        // Complete checkout
+        await this.checkOut(palletId, scannedBy?.trim() || 'Unknown', true);
+      } else {
+        // Partial checkout
+        await this.removePartialQuantity(palletId, qty, scannedBy?.trim() || 'Unknown');
+      }
+      
+      this.scanMode = null;
+      
+    } else if (this.scanMode === 'checkout-units') {
+      this.stopScanner();
+      
+      // Parse pallet data if it's a JSON QR
+      const palletId = palletData ? palletData.id : code;
+      
+      // Find the pallet
+      const pallet = this.pallets.find(p => p.id === palletId || p.product_id === palletId);
+      if (!pallet) {
+        this.showToast('Pallet not found in inventory', 'error');
+        this.scanMode = null;
         this.render();
         return;
       }
@@ -872,31 +1011,38 @@ const app = {
       if (!pallet.product_quantity || pallet.product_quantity === 0) {
         this.showToast('This pallet does not track individual units. Use "Check Out Pallet" instead.', 'error');
         this.scanMode = null;
-        this.tempCheckoutUnits = null;
         this.render();
         return;
       }
       
       // Show pallet info and ask for units to remove
-      const totalUnits = pallet.pallet_quantity * pallet.product_quantity;
+      const currentUnits = pallet.current_units || (pallet.pallet_quantity * pallet.product_quantity);
       const unitsToRemove = await this.prompt(
         'Check Out Units',
         `<div class="mb-3">
           <p class="font-bold text-lg mb-2">${pallet.product_id}</p>
           <p class="text-sm text-gray-600">Customer: ${pallet.customer_name}</p>
           <p class="text-sm text-gray-600">Location: ${pallet.location}</p>
-          <p class="text-sm font-semibold mt-2">Available: ${totalUnits} units (${pallet.pallet_quantity} pallets × ${pallet.product_quantity} units/pallet)</p>
+          <p class="text-sm font-semibold mt-2">Available: ${currentUnits} units</p>
         </div>
         <p class="font-semibold">How many units to check out?</p>`,
         '1'
       );
       
-      if (unitsToRemove !== null) {
-        await this.removePartialUnits(code);
+      if (unitsToRemove === null) {
+        this.scanMode = null;
+        return;
       }
       
+      // Ask who is checking out
+      const scannedBy = await this.prompt('Scanned By', 'Who is checking out these units?', '');
+      if (scannedBy === null) {
+        this.scanMode = null;
+        return;
+      }
+      
+      await this.removePartialUnits(palletId, parseInt(unitsToRemove), scannedBy?.trim() || 'Unknown');
       this.scanMode = null;
-      this.tempCheckoutUnits = null;
     }
   },
   
@@ -1054,40 +1200,90 @@ const app = {
   },
   
   async generatePalletQR() {
-    const palletId = await this.prompt('Pallet ID', 'Enter pallet ID (or leave blank for auto-generated):');
-    if (palletId === null) return;
-    
-    const finalId = palletId.trim() || `PLT-${Date.now()}`;
-    
     const customerName = await this.prompt('Customer Name', 'Enter customer name:');
-    if (customerName === null) return;
-    if (!customerName.trim()) {
-      this.showToast('Customer name is required', 'error');
+    if (customerName === null || !customerName.trim()) {
+      if (customerName !== null) this.showToast('Customer name is required', 'error');
       return;
     }
     
-    const productDesc = await this.prompt('Product Description', 'Enter product description (optional):', '');
-    if (productDesc === null) return;
+    const productDesc = await this.prompt('Product Description', 'Enter product description:');
+    if (productDesc === null || !productDesc.trim()) {
+      if (productDesc !== null) this.showToast('Product description is required', 'error');
+      return;
+    }
     
     const palletQuantity = await this.prompt('Pallet Quantity', 'How many pallets?', '1');
     if (palletQuantity === null) return;
     
-    const productQuantity = await this.prompt('Product Quantity (Optional)', 'Units per pallet:', '0');
+    const productQuantity = await this.prompt('Units per Pallet', 'Units per pallet (0 if not tracking):', '0');
     if (productQuantity === null) return;
     
-    this.view = 'single-qr';
-    this.tempPallet = {
-      id: finalId,
+    // Ask if they want to add parts list
+    const addParts = await this.confirm('Add Parts List', 'Would you like to add a detailed parts list?');
+    let parts = null;
+    
+    if (addParts) {
+      const partsList = await this.promptMultiline(
+        'Parts List',
+        'Enter parts for this pallet (one per line):\nFormat: Part Number | Quantity',
+        ''
+      );
+      
+      if (partsList && partsList.trim()) {
+        parts = this.parsePartsList(partsList);
+      }
+    }
+    
+    const palletId = `PLT-${Date.now()}`;
+    
+    // Encode all data as JSON in the QR code
+    const qrData = {
+      type: 'PALLET',
+      id: palletId,
       customer: customerName.trim(),
       product: productDesc.trim(),
       palletQty: parseInt(palletQuantity) || 1,
-      productQty: parseInt(productQuantity) || 0
+      productQty: parseInt(productQuantity) || 0,
+      parts: parts
     };
+    
+    this.view = 'single-qr';
+    this.tempPallet = qrData;
     this.render();
     
     setTimeout(async () => {
-      await this.generateQRCode(finalId, 'single-qr-canvas');
-      this.showToast('QR code generated successfully!', 'success');
+      // Generate QR with JSON data
+      await this.generateQRCode(JSON.stringify(qrData), 'single-qr-canvas');
+      this.showToast('QR code generated with all pallet data!', 'success');
+    }, 100);
+  },
+  
+  async reprintPalletQR(palletId) {
+    const pallet = this.pallets.find(p => p.id === palletId);
+    if (!pallet) {
+      this.showToast('Pallet not found', 'error');
+      return;
+    }
+    
+    // Create QR data with all pallet information
+    const qrData = {
+      type: 'PALLET',
+      id: pallet.id,
+      customer: pallet.customer_name,
+      product: pallet.product_id,
+      palletQty: pallet.pallet_quantity,
+      productQty: pallet.product_quantity,
+      parts: pallet.parts
+    };
+    
+    this.view = 'single-qr';
+    this.tempPallet = qrData;
+    this.render();
+    
+    setTimeout(async () => {
+      // Generate QR with JSON data
+      await this.generateQRCode(JSON.stringify(qrData), 'single-qr-canvas');
+      this.showToast('QR code ready to reprint!', 'success');
     }, 100);
   },
   
@@ -1249,14 +1445,22 @@ const app = {
     if (!this.googleSheetsUrl) return;
     
     try {
-      console.log('Syncing to Google Sheets:', action, data);
+      console.log('===== SYNCING TO GOOGLE SHEETS =====');
+      console.log('Action:', action);
+      console.log('Data being sent:', JSON.stringify(data, null, 2));
+      
       const response = await fetch(this.googleSheetsUrl, {
         method: 'POST',
         mode: 'no-cors',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action, data })
       });
-      console.log('Sync request sent for action:', action);
+      
+      console.log('Sync request sent successfully');
+      
+      // Give Google Sheets time to process
+      await new Promise(resolve => setTimeout(resolve, 500));
+      console.log('===== SYNC COMPLETE =====');
     } catch (e) {
       console.error('Google Sheets sync error:', e);
       // Don't show error to user - sync failures shouldn't block operations
@@ -1982,6 +2186,9 @@ const app = {
                   ` : ''}
                 </div>
                 <div class="flex flex-col gap-2 ml-4">
+                  <button onclick="app.reprintPalletQR('${p.id}')" class="bg-purple-500 text-white px-4 py-2 rounded-xl text-sm font-bold hover:bg-purple-600 shadow-md whitespace-nowrap">
+                    🖨️ Reprint QR
+                  </button>
                   <button onclick="app.removePartialQuantity('${p.id}')" class="bg-orange-500 text-white px-4 py-2 rounded-xl text-sm font-bold hover:bg-orange-600 shadow-md whitespace-nowrap">
                     Remove Pallets
                   </button>

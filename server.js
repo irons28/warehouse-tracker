@@ -41,6 +41,7 @@ db.serialize(() => {
       );
       const hasParts = columns.some((col) => col.name === "parts");
       const hasCurrentUnits = columns.some((col) => col.name === "current_units");
+      const hasScannedBy = columns.some((col) => col.name === "scanned_by");
 
       if (hasQuantity && !hasPalletQuantity) {
         console.log("🔄 Migrating database to new schema...");
@@ -90,6 +91,14 @@ db.serialize(() => {
           }
         });
       }
+
+      if (!hasScannedBy) {
+        console.log("🔄 Adding scanned_by column...");
+        db.run("ALTER TABLE pallets ADD COLUMN scanned_by TEXT DEFAULT 'Unknown'", (err) => {
+          if (err) console.error("Error adding scanned_by column:", err);
+          else console.log("✓ scanned_by column added");
+        });
+      }
     }
   });
 
@@ -104,6 +113,7 @@ db.serialize(() => {
     current_units INTEGER DEFAULT 0,
     location TEXT NOT NULL,
     parts TEXT,
+    scanned_by TEXT DEFAULT 'Unknown',
     date_added DATETIME DEFAULT CURRENT_TIMESTAMP,
     date_removed DATETIME,
     status TEXT DEFAULT 'active'
@@ -142,6 +152,7 @@ db.serialize(() => {
     quantity_after INTEGER,
     location TEXT,
     notes TEXT,
+    scanned_by TEXT DEFAULT 'Unknown',
     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
   )`,
     (err) => {
@@ -149,6 +160,20 @@ db.serialize(() => {
       else console.log("✓ Activity log table ready");
     },
   );
+  
+  // Add scanned_by column to activity_log if it doesn't exist
+  db.all("PRAGMA table_info(activity_log)", (err, columns) => {
+    if (!err && columns) {
+      const hasScannedBy = columns.some((col) => col.name === "scanned_by");
+      if (!hasScannedBy) {
+        console.log("🔄 Adding scanned_by to activity_log...");
+        db.run("ALTER TABLE activity_log ADD COLUMN scanned_by TEXT DEFAULT 'Unknown'", (err) => {
+          if (err) console.error("Error adding scanned_by to activity_log:", err);
+          else console.log("✓ scanned_by column added to activity_log");
+        });
+      }
+    }
+  });
 
   // Populate locations if empty
   db.get("SELECT COUNT(*) as count FROM locations", (err, row) => {
@@ -240,6 +265,7 @@ app.post("/api/pallets", (req, res) => {
     product_quantity,
     location,
     parts,
+    scanned_by,
   } = req.body;
 
   if (!customer_name || !product_id || !location) {
@@ -251,9 +277,10 @@ app.post("/api/pallets", (req, res) => {
   const palletId = id || `PLT-${Date.now()}`;
   const partsJson = parts ? JSON.stringify(parts) : null;
   const currentUnits = product_quantity || 0; // Initialize to full capacity
+  const scannedByPerson = scanned_by || 'Unknown';
 
   db.run(
-    "INSERT INTO pallets (id, customer_name, product_id, pallet_quantity, product_quantity, current_units, location, parts) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    "INSERT INTO pallets (id, customer_name, product_id, pallet_quantity, product_quantity, current_units, location, parts, scanned_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     [
       palletId,
       customer_name,
@@ -263,6 +290,7 @@ app.post("/api/pallets", (req, res) => {
       currentUnits,
       location,
       partsJson,
+      scannedByPerson,
     ],
     function (err) {
       if (err) return res.status(500).json({ error: err.message });
@@ -300,7 +328,8 @@ app.post("/api/pallets", (req, res) => {
 // Partial quantity removal
 app.post("/api/pallets/:id/remove-quantity", (req, res) => {
   const { id } = req.params;
-  const { quantity_to_remove } = req.body;
+  const { quantity_to_remove, scanned_by } = req.body;
+  const scannedByPerson = scanned_by || 'Unknown';
 
   if (!quantity_to_remove || quantity_to_remove <= 0) {
     return res.status(400).json({ error: "Valid quantity required" });
@@ -336,7 +365,7 @@ app.post("/api/pallets/:id/remove-quantity", (req, res) => {
 
             // Log activity
             db.run(
-              "INSERT INTO activity_log (pallet_id, customer_name, product_id, action, quantity_changed, quantity_before, quantity_after, location, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              "INSERT INTO activity_log (pallet_id, customer_name, product_id, action, quantity_changed, quantity_before, quantity_after, location, notes, scanned_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
               [
                 row.id,
                 row.customer_name,
@@ -347,6 +376,7 @@ app.post("/api/pallets/:id/remove-quantity", (req, res) => {
                 0,
                 row.location,
                 "Pallet emptied and removed",
+                scannedByPerson,
               ],
             );
 
@@ -368,7 +398,7 @@ app.post("/api/pallets/:id/remove-quantity", (req, res) => {
 
             // Log activity
             db.run(
-              "INSERT INTO activity_log (pallet_id, customer_name, product_id, action, quantity_changed, quantity_before, quantity_after, location) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+              "INSERT INTO activity_log (pallet_id, customer_name, product_id, action, quantity_changed, quantity_before, quantity_after, location, scanned_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
               [
                 row.id,
                 row.customer_name,
@@ -378,6 +408,7 @@ app.post("/api/pallets/:id/remove-quantity", (req, res) => {
                 quantityBefore,
                 quantityAfter,
                 row.location,
+                scannedByPerson,
               ],
             );
 
@@ -397,7 +428,8 @@ app.post("/api/pallets/:id/remove-quantity", (req, res) => {
 // Remove partial units from pallet (NEW FEATURE)
 app.post("/api/pallets/:id/remove-units", (req, res) => {
   const { id } = req.params;
-  const { units_to_remove } = req.body;
+  const { units_to_remove, scanned_by } = req.body;
+  const scannedByPerson = scanned_by || 'Unknown';
 
   if (!units_to_remove || units_to_remove <= 0) {
     return res.status(400).json({ error: "Valid unit quantity required" });
@@ -442,7 +474,7 @@ app.post("/api/pallets/:id/remove-units", (req, res) => {
 
             // Log activity
             db.run(
-              "INSERT INTO activity_log (pallet_id, customer_name, product_id, action, quantity_changed, quantity_before, quantity_after, location, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              "INSERT INTO activity_log (pallet_id, customer_name, product_id, action, quantity_changed, quantity_before, quantity_after, location, notes, scanned_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
               [
                 row.id,
                 row.customer_name,
@@ -453,6 +485,7 @@ app.post("/api/pallets/:id/remove-units", (req, res) => {
                 0,
                 row.location,
                 "All units removed. Pallet cleared.",
+                scannedByPerson,
               ],
             );
 
@@ -484,7 +517,7 @@ app.post("/api/pallets/:id/remove-units", (req, res) => {
 
             // Log activity
             db.run(
-              "INSERT INTO activity_log (pallet_id, customer_name, product_id, action, quantity_changed, quantity_before, quantity_after, location, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              "INSERT INTO activity_log (pallet_id, customer_name, product_id, action, quantity_changed, quantity_before, quantity_after, location, notes, scanned_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
               [
                 row.id,
                 row.customer_name,
@@ -495,6 +528,7 @@ app.post("/api/pallets/:id/remove-units", (req, res) => {
                 unitsAfter,
                 row.location,
                 `Removed ${units_to_remove} units. ${unitsAfter} of ${row.product_quantity} units remaining on pallet.`,
+                scannedByPerson,
               ],
             );
 

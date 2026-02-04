@@ -74,7 +74,7 @@ function getOrCreateCustomerSheet(customerName) {
     // Create new sheet for this customer
     sheet = ss.insertSheet(customerName);
     
-    // Set up headers with styling - NOW WITH REMOVAL TRACKING
+    // Set up headers with styling - NOW WITH REMOVAL TRACKING AND PERSONNEL
     const headers = [
       'Product ID', 
       'Location', 
@@ -83,8 +83,10 @@ function getOrCreateCustomerSheet(customerName) {
       'Current Units',
       'Parts List',
       'Date Added',
+      'Scanned In By',
       'Last Removal Date',
       'Last Removal Qty',
+      'Last Removal By',
       'Status'
     ];
     
@@ -98,13 +100,15 @@ function getOrCreateCustomerSheet(customerName) {
     sheet.setColumnWidth(1, 150); // Product ID
     sheet.setColumnWidth(2, 100); // Location
     sheet.setColumnWidth(3, 80);  // Pallets
-    sheet.setColumnWidth(4, 100); // Units/Pallet
-    sheet.setColumnWidth(5, 100); // Total Units
+    sheet.setColumnWidth(4, 130); // Units/Pallet (Spec)
+    sheet.setColumnWidth(5, 110); // Current Units
     sheet.setColumnWidth(6, 200); // Parts List
     sheet.setColumnWidth(7, 120); // Date Added
-    sheet.setColumnWidth(8, 130); // Last Removal Date
-    sheet.setColumnWidth(9, 130); // Last Removal Qty
-    sheet.setColumnWidth(10, 100); // Status
+    sheet.setColumnWidth(8, 120); // Scanned In By
+    sheet.setColumnWidth(9, 130); // Last Removal Date
+    sheet.setColumnWidth(10, 130); // Last Removal Qty
+    sheet.setColumnWidth(11, 120); // Last Removal By
+    sheet.setColumnWidth(12, 100); // Status
     
     // Freeze header row
     sheet.setFrozenRows(1);
@@ -269,7 +273,7 @@ function handleAddPallet(data) {
   let existingRow = -1;
   
   for (let i = 1; i < values.length; i++) {
-    if (values[i][0] === productId && values[i][1] === location && values[i][9] === 'Active') {
+    if (values[i][0] === productId && values[i][1] === location && values[i][11] === 'Active') {
       existingRow = i + 1;
       break;
     }
@@ -296,7 +300,7 @@ function handleAddPallet(data) {
       `Added ${palletQty} pallets to existing entry`
     );
   } else {
-    // Add new row - with new columns for removal tracking
+    // Add new row - with new columns for removal tracking and personnel
     sheet.appendRow([
       productId,
       location,
@@ -305,8 +309,10 @@ function handleAddPallet(data) {
       currentUnits, // Current Units (starts at full)
       parts,
       dateAdded,
+      data.scanned_by || 'Unknown', // Scanned In By
       '', // Last Removal Date (empty initially)
       '', // Last Removal Qty (empty initially)
+      '', // Last Removal By (empty initially)
       'Active'
     ]);
     
@@ -398,7 +404,7 @@ function handleUpdateQuantity(data) {
   const values = dataRange.getValues();
   
   for (let i = 1; i < values.length; i++) {
-    if (values[i][0] === productId && values[i][1] === location && values[i][9] === 'Active') {
+    if (values[i][0] === productId && values[i][1] === location && values[i][11] === 'Active') {
       const row = i + 1;
       const oldQuantity = parseFloat(values[i][2]);
       const productQty = parseFloat(values[i][3]);
@@ -418,14 +424,16 @@ function handleUpdateQuantity(data) {
         const removalQty = productQty > 0 ? 
           (quantityRemoved * productQty).toFixed(0) + ' units' : 
           quantityRemoved.toFixed(2) + ' pallets';
+        const removalBy = data.scanned_by || 'Unknown';
         
         sheet.getRange(row, 3).setValue(newQuantity); // Pallets
-        sheet.getRange(row, 5).setValue(newTotalUnits); // Total Units
-        sheet.getRange(row, 8).setValue(removalDate); // Last Removal Date
-        sheet.getRange(row, 9).setValue(removalQty); // Last Removal Qty
+        sheet.getRange(row, 5).setValue(newTotalUnits); // Current Units
+        sheet.getRange(row, 9).setValue(removalDate); // Last Removal Date
+        sheet.getRange(row, 10).setValue(removalQty); // Last Removal Qty
+        sheet.getRange(row, 11).setValue(removalBy); // Last Removal By
         
         Logger.log(`Updated row ${row}: Pallets=${newQuantity}, Total Units=${newTotalUnits}`);
-        Logger.log(`Removal tracked: ${removalQty} on ${removalDate}`);
+        Logger.log(`Removal tracked: ${removalQty} on ${removalDate} by ${removalBy}`);
       }
       
       // Log to removals sheet
@@ -485,7 +493,7 @@ function handleUnitsRemove(data) {
   const values = dataRange.getValues();
   
   for (let i = 1; i < values.length; i++) {
-    if (values[i][0] === productId && values[i][1] === location && values[i][9] === 'Active') {
+    if (values[i][0] === productId && values[i][1] === location && values[i][11] === 'Active') {
       const row = i + 1;
       const oldPalletQty = parseFloat(values[i][2]);
       const unitsPerPalletSpec = parseFloat(values[i][3]); // Original spec (never changes)
@@ -507,15 +515,17 @@ function handleUnitsRemove(data) {
         // Update current units while keeping spec constant
         const removalDate = new Date();
         const removalQty = unitsRemoved + ' units';
+        const removalBy = data.scanned_by || 'Unknown';
         
         sheet.getRange(row, 3).setValue(newPalletQty); // Pallets (stays same, usually 1)
         sheet.getRange(row, 4).setValue(unitsPerPalletSpec); // Units/Pallet Spec (NEVER changes)
         sheet.getRange(row, 5).setValue(newCurrentUnits); // Current Units (updated)
-        sheet.getRange(row, 8).setValue(removalDate); // Last Removal Date
-        sheet.getRange(row, 9).setValue(removalQty); // Last Removal Qty
+        sheet.getRange(row, 9).setValue(removalDate); // Last Removal Date
+        sheet.getRange(row, 10).setValue(removalQty); // Last Removal Qty
+        sheet.getRange(row, 11).setValue(removalBy); // Last Removal By
         
         Logger.log(`Updated row ${row}: ${newPalletQty} pallets, ${unitsPerPalletSpec} spec, ${newCurrentUnits} current`);
-        Logger.log(`Removal tracked: ${removalQty} on ${removalDate}`);
+        Logger.log(`Removal tracked: ${removalQty} on ${removalDate} by ${removalBy}`);
       }
       
       // Log to removals sheet
@@ -572,6 +582,7 @@ function handleSyncAll(data) {
     const productQty = pallet.product_quantity || 0;
     const currentUnits = pallet.current_units || (pallet.pallet_quantity * productQty);
     const parts = pallet.parts ? formatPartsList(pallet.parts) : '';
+    const scannedBy = pallet.scanned_by || 'Unknown';
     
     sheet.appendRow([
       pallet.product_id,
@@ -581,8 +592,10 @@ function handleSyncAll(data) {
       currentUnits, // Current Units
       parts,
       new Date(pallet.date_added),
+      scannedBy, // Scanned In By
       '', // Last Removal Date (empty for sync)
       '', // Last Removal Qty (empty for sync)
+      '', // Last Removal By (empty for sync)
       'Active'
     ]);
   });
