@@ -205,8 +205,35 @@ const app = {
       if (this.selectedCustomer) {
         url += `?customer=${encodeURIComponent(this.selectedCustomer)}`;
       }
-      const res = await fetch(url);
+      // Add timestamp to prevent caching
+      url += (url.includes('?') ? '&' : '?') + '_t=' + Date.now();
+      
+      console.log('Loading pallets from:', url);
+      const res = await fetch(url, {
+        cache: 'no-store',
+        headers: {
+          'Cache-Control': 'no-cache',
+          'Pragma': 'no-cache'
+        }
+      });
+      
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+      }
+      
       this.pallets = await res.json();
+      console.log('Loaded pallets:', this.pallets.length, 'pallets');
+      
+      // Log the specific pallet quantities for debugging
+      if (this.pallets.length > 0) {
+        console.log('Sample pallet data:', this.pallets.map(p => ({
+          id: p.id,
+          product_id: p.product_id,
+          pallet_qty: p.pallet_quantity,
+          unit_qty: p.product_quantity,
+          total: p.pallet_quantity * p.product_quantity
+        })));
+      }
     } catch (e) {
       console.error('Error loading pallets:', e);
       throw e;
@@ -350,6 +377,14 @@ const app = {
       return;
     }
     
+    console.log('BEFORE REMOVAL - Pallet state:', {
+      id: pallet.id,
+      product_id: pallet.product_id,
+      pallet_quantity: pallet.pallet_quantity,
+      product_quantity: pallet.product_quantity,
+      total_units: pallet.pallet_quantity * pallet.product_quantity
+    });
+    
     const qtyToRemove = await this.prompt(
       'Remove Pallets',
       `Current pallet quantity: <strong>${pallet.pallet_quantity}</strong><br><br>How many pallets to remove?`,
@@ -371,15 +406,26 @@ const app = {
     
     this.setLoading(true);
     try {
+      console.log('===== STARTING PALLET REMOVAL =====');
+      console.log('Removing pallets:', qty, 'from pallet:', pallet.id);
       const res = await fetch(`${API_URL}/api/pallets/${palletId}/remove-quantity`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ quantity_to_remove: qty })
       });
+      
+      if (!res.ok) {
+        const error = await res.json();
+        throw new Error(error.error || 'Server error');
+      }
+      
       const data = await res.json();
+      console.log('===== SERVER RESPONSE =====');
+      console.log('Full response:', data);
       this.showToast(data.message || 'Pallets removed successfully!', 'success');
       
       if (this.googleSheetsUrl) {
+        console.log('===== SYNCING TO GOOGLE SHEETS =====');
         const newQuantity = pallet.pallet_quantity - qty;
         if (newQuantity === 0) {
           await this.syncToGoogleSheets('remove_pallet', {
@@ -395,15 +441,44 @@ const app = {
             new_quantity: newQuantity
           });
         }
+        console.log('Google Sheets sync complete');
       }
       
-      await this.loadPallets();
-      await this.loadStats();
-      await this.loadActivity();
+      // Reload data with cache busting
+      console.log('===== RELOADING DATA =====');
+      console.log('Waiting 200ms for database to settle...');
+      await new Promise(resolve => setTimeout(resolve, 200));
+      
+      console.log('Clearing cached data...');
+      this.pallets = [];
+      
+      console.log('Fetching fresh data...');
+      await Promise.all([
+        this.loadPallets(),
+        this.loadStats(),
+        this.loadActivity()
+      ]);
+      
+      console.log('===== DATA RELOADED =====');
+      console.log('Total pallets:', this.pallets.length);
+      
+      const updatedPallet = this.pallets.find(p => p.id === pallet.id);
+      if (updatedPallet) {
+        console.log('===== FOUND UPDATED PALLET =====');
+        console.log('New state:', {
+          pallet_quantity: updatedPallet.pallet_quantity,
+          product_quantity: updatedPallet.product_quantity,
+          total_units: updatedPallet.pallet_quantity * updatedPallet.product_quantity
+        });
+      } else {
+        console.log('===== PALLET REMOVED =====');
+      }
+      
       this.render();
+      console.log('===== RENDER COMPLETE =====');
     } catch (e) {
-      this.showToast('Error removing pallets', 'error');
-      console.error(e);
+      console.error('===== ERROR REMOVING PALLETS =====', e);
+      this.showToast('Error removing pallets: ' + e.message, 'error');
     } finally {
       this.setLoading(false);
     }
@@ -422,11 +497,26 @@ const app = {
       return;
     }
     
-    const totalUnits = pallet.pallet_quantity * pallet.product_quantity;
+    const currentUnits = pallet.current_units || (pallet.pallet_quantity * pallet.product_quantity);
+    const totalUnits = pallet.pallet_quantity * currentUnits;
+    
+    console.log('BEFORE REMOVAL - Pallet state:', {
+      id: pallet.id,
+      product_id: pallet.product_id,
+      pallet_quantity: pallet.pallet_quantity,
+      product_quantity: pallet.product_quantity,
+      current_units: currentUnits,
+      total_units: totalUnits
+    });
     
     const unitsToRemove = await this.prompt(
       'Remove Units',
-      `Current total units: <strong>${totalUnits}</strong> (${pallet.pallet_quantity} pallets × ${pallet.product_quantity} units/pallet)<br><br>How many units to remove?`,
+      `<div class="space-y-2">
+        <p><strong>Original Capacity:</strong> ${pallet.product_quantity} units/pallet</p>
+        <p><strong>Current Units:</strong> ${currentUnits} units (${pallet.pallet_quantity} pallet${pallet.pallet_quantity > 1 ? 's' : ''})</p>
+        <p class="font-bold text-lg">Available: ${totalUnits} total units</p>
+      </div>
+      <p class="mt-3">How many units to remove?</p>`,
       '1'
     );
     
@@ -445,16 +535,28 @@ const app = {
     
     this.setLoading(true);
     try {
+      console.log('===== STARTING UNIT REMOVAL =====');
+      console.log('Removing units:', units, 'from pallet:', pallet.id);
+      
       const res = await fetch(`${API_URL}/api/pallets/${pallet.id}/remove-units`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ units_to_remove: units })
       });
+      
+      if (!res.ok) {
+        const error = await res.json();
+        throw new Error(error.error || 'Server error');
+      }
+      
       const data = await res.json();
-      this.showToast(data.message || 'Units removed successfully!', 'success');
+      console.log('===== SERVER RESPONSE =====');
+      console.log('Full response:', data);
+      console.log('Updated pallet should be:', data.updated_pallet);
       
       // Sync to Google Sheets
       if (this.googleSheetsUrl) {
+        console.log('===== SYNCING TO GOOGLE SHEETS =====');
         const newPalletQty = data.pallets_remaining;
         if (newPalletQty === 0) {
           await this.syncToGoogleSheets('remove_pallet', {
@@ -472,18 +574,184 @@ const app = {
             units_per_pallet: pallet.product_quantity
           });
         }
+        console.log('Google Sheets sync complete');
       }
       
-      await this.loadPallets();
-      await this.loadStats();
-      await this.loadActivity();
+      // Show success message
+      this.showToast(data.message || 'Units removed successfully!', 'success');
+      
+      // Force reload with delay and cache busting
+      console.log('===== RELOADING DATA =====');
+      console.log('Waiting 200ms for database to settle...');
+      await new Promise(resolve => setTimeout(resolve, 200));
+      
+      console.log('Clearing cached data...');
+      this.pallets = []; // Clear cache
+      
+      console.log('Fetching fresh data...');
+      await Promise.all([
+        this.loadPallets(),
+        this.loadStats(),
+        this.loadActivity()
+      ]);
+      
+      console.log('===== DATA RELOADED =====');
+      console.log('Total pallets loaded:', this.pallets.length);
+      console.log('All pallet data:', this.pallets.map(p => ({
+        id: p.id,
+        product_id: p.product_id,
+        pallet_qty: p.pallet_quantity,
+        product_qty: p.product_quantity,
+        total_units: p.pallet_quantity * p.product_quantity
+      })));
+      
+      // Find the updated pallet
+      const updatedPallet = this.pallets.find(p => p.id === pallet.id);
+      if (updatedPallet) {
+        console.log('===== FOUND UPDATED PALLET =====');
+        console.log('Updated pallet data:', {
+          id: updatedPallet.id,
+          product_id: updatedPallet.product_id,
+          pallet_quantity: updatedPallet.pallet_quantity,
+          product_quantity: updatedPallet.product_quantity,
+          total_units: updatedPallet.pallet_quantity * updatedPallet.product_quantity
+        });
+      } else {
+        console.log('===== PALLET REMOVED FROM INVENTORY =====');
+        console.log('Pallet', pallet.id, 'is no longer in active inventory (quantity reached 0)');
+      }
+      
+      // Force re-render
+      console.log('===== FORCING RE-RENDER =====');
       this.render();
+      console.log('===== RENDER COMPLETE =====');
+      
     } catch (e) {
-      this.showToast('Error removing units', 'error');
-      console.error(e);
+      console.error('===== ERROR REMOVING UNITS =====', e);
+      this.showToast('Error removing units: ' + e.message, 'error');
     } finally {
       this.setLoading(false);
     }
+  },
+  
+  // NEW: Show detailed product information including removal history
+  async showProductInfo(palletId) {
+    const pallet = this.pallets.find(p => p.id === palletId);
+    if (!pallet) {
+      this.showToast('Pallet not found', 'error');
+      return;
+    }
+    
+    // Get removal history for this pallet from activity log
+    const removalHistory = this.activityLog.filter(a => 
+      a.product_id === pallet.product_id && 
+      a.location === pallet.location &&
+      (a.action === 'PARTIAL_REMOVE' || a.action === 'UNITS_REMOVE')
+    );
+    
+    const totalUnits = pallet.pallet_quantity * pallet.product_quantity;
+    
+    const content = `
+      <div class="space-y-4">
+        <div class="bg-gradient-to-r from-blue-50 to-blue-100 p-4 rounded-lg border-l-4 border-blue-500">
+          <h4 class="font-bold text-lg text-gray-900 mb-3">${pallet.product_id}</h4>
+          
+          <div class="grid grid-cols-2 gap-3 text-sm">
+            <div>
+              <span class="text-gray-600">Customer:</span>
+              <span class="font-semibold ml-2">${pallet.customer_name}</span>
+            </div>
+            <div>
+              <span class="text-gray-600">Location:</span>
+              <span class="font-semibold ml-2">${pallet.location}</span>
+            </div>
+            <div>
+              <span class="text-gray-600">Pallets:</span>
+              <span class="font-semibold ml-2">${pallet.pallet_quantity}</span>
+            </div>
+            <div>
+              <span class="text-gray-600">Units/Pallet:</span>
+              <span class="font-semibold ml-2">${pallet.product_quantity || 'N/A'}</span>
+            </div>
+            ${pallet.product_quantity > 0 ? `
+              <div class="col-span-2">
+                <span class="text-gray-600">Total Units:</span>
+                <span class="font-bold ml-2 text-blue-600">${totalUnits}</span>
+              </div>
+            ` : ''}
+            <div class="col-span-2">
+              <span class="text-gray-600">Date Added:</span>
+              <span class="font-semibold ml-2">${new Date(pallet.date_added).toLocaleString()}</span>
+            </div>
+          </div>
+          
+          ${pallet.parts && pallet.parts.length > 0 ? `
+            <div class="mt-4 p-3 bg-white rounded-lg">
+              <p class="text-sm font-semibold text-gray-700 mb-2">📋 Parts List:</p>
+              <div class="space-y-1">
+                ${pallet.parts.map(part => `
+                  <div class="text-sm text-gray-700 flex justify-between">
+                    <span>${part.part_number}</span>
+                    <span class="font-semibold">×${part.quantity}</span>
+                  </div>
+                `).join('')}
+              </div>
+            </div>
+          ` : ''}
+        </div>
+        
+        ${removalHistory.length > 0 ? `
+          <div>
+            <h5 class="font-bold text-gray-900 mb-2 flex items-center gap-2">
+              <span class="text-red-500">🗑️</span> Removal History
+            </h5>
+            <div class="max-h-48 overflow-y-auto space-y-2">
+              ${removalHistory.map(r => `
+                <div class="bg-red-50 p-3 rounded-lg border border-red-200 text-sm">
+                  <div class="flex justify-between items-start mb-1">
+                    <span class="font-semibold text-red-700">${r.action === 'UNITS_REMOVE' ? 'Units Removed' : 'Pallets Removed'}</span>
+                    <span class="text-xs text-gray-500">${new Date(r.timestamp).toLocaleDateString()}</span>
+                  </div>
+                  <div class="grid grid-cols-3 gap-2 text-xs mt-2">
+                    <div>
+                      <span class="text-gray-600">Removed:</span>
+                      <span class="font-bold ml-1">${r.quantity_changed}</span>
+                    </div>
+                    <div>
+                      <span class="text-gray-600">Before:</span>
+                      <span class="font-semibold ml-1">${r.quantity_before}</span>
+                    </div>
+                    <div>
+                      <span class="text-gray-600">After:</span>
+                      <span class="font-semibold ml-1">${r.quantity_after}</span>
+                    </div>
+                  </div>
+                  ${r.notes ? `<p class="text-xs text-gray-600 mt-2 italic">${r.notes}</p>` : ''}
+                </div>
+              `).join('')}
+            </div>
+          </div>
+        ` : `
+          <div class="bg-green-50 p-3 rounded-lg border border-green-200 text-sm text-green-700">
+            ✓ No removals yet - full original quantity
+          </div>
+        `}
+        
+        <div class="pt-3 border-t border-gray-200">
+          <p class="text-xs text-gray-500 mb-3">Need to remove this pallet completely?</p>
+          <button 
+            onclick="app.closeModal(); app.checkOut('${pallet.id}')" 
+            class="w-full bg-red-500 text-white px-4 py-2 rounded-lg font-semibold hover:bg-red-600"
+          >
+            🗑️ Remove All (Complete Checkout)
+          </button>
+        </div>
+      </div>
+    `;
+    
+    await this.showModal('Product Information', content, [
+      { text: 'Close', value: 'close' }
+    ]);
   },
   
   startScanner(mode) {
@@ -981,14 +1249,17 @@ const app = {
     if (!this.googleSheetsUrl) return;
     
     try {
-      await fetch(this.googleSheetsUrl, {
+      console.log('Syncing to Google Sheets:', action, data);
+      const response = await fetch(this.googleSheetsUrl, {
         method: 'POST',
         mode: 'no-cors',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action, data })
       });
+      console.log('Sync request sent for action:', action);
     } catch (e) {
       console.error('Google Sheets sync error:', e);
+      // Don't show error to user - sync failures shouldn't block operations
     }
   },
   
@@ -1691,7 +1962,7 @@ const app = {
                         📦 ${p.product_quantity} units/pallet
                       </span>
                       <span class="bg-gradient-to-r from-blue-100 to-blue-50 text-blue-700 px-3 py-1 rounded-full font-bold">
-                        = ${p.pallet_quantity * p.product_quantity} total units
+                        = ${p.current_units || (p.pallet_quantity * p.product_quantity)} total units
                       </span>
                     ` : ''}
                     <span class="text-xs text-gray-500">Added ${new Date(p.date_added).toLocaleDateString()}</span>
@@ -1719,8 +1990,8 @@ const app = {
                       Remove Units
                     </button>
                   ` : ''}
-                  <button onclick="app.checkOut('${p.id}')" class="bg-red-500 text-white px-4 py-2 rounded-xl text-sm font-bold hover:bg-red-600 shadow-md whitespace-nowrap">
-                    Remove All
+                  <button onclick="app.showProductInfo('${p.id}')" class="bg-blue-500 text-white px-4 py-2 rounded-xl text-sm font-bold hover:bg-blue-600 shadow-md whitespace-nowrap">
+                    Product Info
                   </button>
                 </div>
               </div>
