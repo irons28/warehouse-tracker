@@ -1,7 +1,26 @@
+/* Warehouse Tracker - locked working build
+   NOTE: Load-guard prevents duplicate execution (e.g., service worker cache / double script tags).
+*/
+(() => {
+  if (window.__WT_APP_LOADED__) {
+    console.warn("Warehouse Tracker app.js already loaded - skipping duplicate execution.");
+    return;
+  }
+  window.__WT_APP_LOADED__ = true;
+
 const API_URL = window.location.origin;
 
 const app = {
-  view: 'scan',
+  view: 'tracker',
+    setView(view) {
+    this.view = view;
+    this.sidebarOpen = false; // close sidebar on nav click
+    this.scanMode = null;     // safety: exit scanner mode if any
+    if (typeof this.render === "function") this.render();
+  },
+  
+  trackerView: 'table',
+  sidebarOpen: false,
   pallets: [],
   locations: [],
   stats: {},
@@ -15,8 +34,13 @@ const app = {
   scanner: null,
   loading: false,
   charts: {},
-  googleSheetsUrl: localStorage.getItem('googleSheetsUrl') || '',
-  
+
+  // ✅ Option B (server-side Sheets): this is now loaded from /api/settings
+  googleSheetsUrl: '',
+  socket: null,
+  autoRefreshInterval: null,
+  lastRefresh: Date.now(),
+
   showToast(message, type = 'info') {
     const container = document.getElementById('toast-container');
     const toast = document.createElement('div');
@@ -29,34 +53,102 @@ const app = {
       setTimeout(() => toast.remove(), 300);
     }, 3000);
   },
-  
+
   showModal(title, content, buttons = []) {
-    return new Promise((resolve) => {
-      const container = document.getElementById('modal-container');
-      const backdrop = document.createElement('div');
-      backdrop.className = 'modal-backdrop';
-      const modal = document.createElement('div');
-      modal.className = 'modal';
-      modal.innerHTML = `
-        <div class="p-6">
-          <h3 class="text-xl font-bold mb-4">${title}</h3>
-          <div class="mb-6">${content}</div>
-          <div class="flex gap-2 justify-end">
-            ${buttons.map((btn, i) => `
-              <button onclick="app.closeModal(${i})" class="px-4 py-2 rounded-lg font-semibold ${btn.primary ? 'bg-blue-600 text-white hover:bg-blue-700' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'}">
-                ${btn.text}
-              </button>
-            `).join('')}
+  return new Promise((resolve) => {
+    // Ensure modal root exists (fixes "container is null" issues)
+    let container = document.getElementById("modal-container");
+    if (!container) {
+      container = document.createElement("div");
+      container.id = "modal-container";
+      document.body.appendChild(container);
+    }
+
+    const close = (result = null) => {
+      container.innerHTML = "";
+      container.classList.remove("open");
+      resolve(result);
+    };
+
+    const btnHtml = (buttons || []).map((b, i) => {
+      const cls = b.class || "bg-gray-200 text-gray-900 px-4 py-2 rounded-lg font-semibold";
+      const text = b.text || `Button ${i + 1}`;
+      return `<button data-modal-btn="${i}" class="${cls}">${text}</button>`;
+    }).join("");
+
+    container.innerHTML = `
+      <div class="wt-modal-backdrop" style="
+        position:fixed; inset:0; background:rgba(0,0,0,.55);
+        display:flex; align-items:center; justify-content:center;
+        z-index:9999; padding:16px;
+      ">
+        <div class="wt-modal" style="
+          width:min(720px, 100%); background:#fff; border-radius:16px;
+          box-shadow:0 20px 60px rgba(0,0,0,.25);
+          overflow:hidden;
+        ">
+          <div style="display:flex; align-items:center; justify-content:space-between; padding:16px 18px; border-bottom:1px solid #eee;">
+            <h3 style="margin:0; font-size:18px; font-weight:800;">${title || ""}</h3>
+            <button id="wt-modal-x" aria-label="Close" style="
+              font-size:24px; line-height:1; border:0; background:transparent; cursor:pointer; padding:4px 10px;
+            ">×</button>
           </div>
+
+          <div style="padding:18px;">
+            ${content || ""}
+          </div>
+
+          ${btnHtml ? `
+            <div style="display:flex; gap:10px; justify-content:flex-end; padding:14px 18px; border-top:1px solid #eee;">
+              ${btnHtml}
+            </div>
+          ` : ""}
         </div>
-      `;
-      container.appendChild(backdrop);
-      container.appendChild(modal);
-      window.modalResolve = resolve;
-      window.modalButtons = buttons;
+      </div>
+    `;
+
+    container.classList.add("open");
+
+    // Close handlers
+    const backdrop = container.querySelector(".wt-modal-backdrop");
+    const xBtn = container.querySelector("#wt-modal-x");
+    if (xBtn) xBtn.addEventListener("click", () => close(null));
+    if (backdrop) backdrop.addEventListener("click", (e) => {
+      if (e.target === backdrop) close(null);
     });
-  },
-  
+
+    // Button handlers
+    const btnEls = container.querySelectorAll("[data-modal-btn]");
+    btnEls.forEach((el) => {
+      el.addEventListener("click", async () => {
+        const idx = Number(el.getAttribute("data-modal-btn"));
+        const cfg = buttons[idx];
+        try {
+          if (cfg && typeof cfg.handler === "function") {
+            const out = await cfg.handler();
+            // If handler explicitly returns something, close with it
+            if (out !== undefined) close(out);
+          } else {
+            close(idx);
+          }
+        } catch (err) {
+          console.error("Modal button handler error:", err);
+          // Keep modal open so you can correct inputs
+        }
+      });
+    });
+
+    // Escape to close
+    const onKey = (e) => {
+      if (e.key === "Escape") {
+        document.removeEventListener("keydown", onKey);
+        close(null);
+      }
+    };
+    document.addEventListener("keydown", onKey);
+  });
+},
+
   closeModal(buttonIndex) {
     const container = document.getElementById('modal-container');
     const input = container.querySelector('input');
@@ -72,7 +164,7 @@ const app = {
       }
     }
   },
-  
+
   async confirm(title, message) {
     const result = await this.showModal(title, `<p class="text-gray-700">${message}</p>`, [
       { text: 'Cancel', value: false },
@@ -80,7 +172,7 @@ const app = {
     ]);
     return result;
   },
-  
+
   async prompt(title, message, defaultValue = '') {
     const inputId = 'modal-input-' + Date.now();
     return new Promise((resolve) => {
@@ -116,7 +208,7 @@ const app = {
       window.promptResolve = resolve;
     });
   },
-  
+
   // NEW: Multi-line prompt for listing parts
   async promptMultiline(title, message, defaultValue = '') {
     const inputId = 'modal-textarea-' + Date.now();
@@ -145,14 +237,12 @@ const app = {
       container.appendChild(modal);
       setTimeout(() => {
         const input = document.getElementById(inputId);
-        if (input) {
-          input.focus();
-        }
+        if (input) input.focus();
       }, 100);
       window.promptResolve = resolve;
     });
   },
-  
+
   closePrompt(inputId, action) {
     const container = document.getElementById('modal-container');
     const input = document.getElementById(inputId);
@@ -163,7 +253,7 @@ const app = {
       window.promptResolve = null;
     }
   },
-  
+
   setLoading(isLoading) {
     this.loading = isLoading;
     if (isLoading) {
@@ -180,7 +270,105 @@ const app = {
       if (loadingEl) loadingEl.remove();
     }
   },
-  
+
+  // =========================
+  // ✅ (B/C) Server-side settings + Sheets
+  // =========================
+  async loadServerSettings() {
+    try {
+      const res = await fetch(`${API_URL}/api/settings`, { cache: "no-store" });
+      const settings = await res.json();
+      this.googleSheetsUrl = settings.googleSheetsUrl || "";
+    } catch (e) {
+      console.error("Failed to load server settings:", e);
+    }
+  },
+
+  // Option B: server does syncing; keep this as a no-op for compatibility
+  async syncToGoogleSheets(action, data) {
+    return;
+  },
+
+  async saveGoogleSheetsUrl(url) {
+    const clean = (url || "").trim();
+    this.googleSheetsUrl = clean;
+
+    try {
+      const res = await fetch(`${API_URL}/api/settings/google-sheets-url`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: clean })
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        this.showToast(data.error || "Failed to save URL", "error");
+        return;
+      }
+
+      this.showToast(clean ? "Google Sheets URL saved on server!" : "Google Sheets sync disabled", "success");
+    } catch (e) {
+      console.error(e);
+      this.showToast("Failed to save URL on server", "error");
+    }
+  },
+
+  async testGoogleSheetsConnection() {
+    this.setLoading(true);
+    try {
+      const res = await fetch(`${API_URL}/api/sheets/test`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" }
+      });
+      const data = await res.json();
+      this.showToast("Server test sent! Check your Google Sheet.", "info");
+      console.log("Sheets test result:", data);
+    } catch (e) {
+      console.error(e);
+      this.showToast("Server test failed.", "error");
+    } finally {
+      this.setLoading(false);
+    }
+  },
+
+  async syncAllToGoogleSheets() {
+    if (!this.googleSheetsUrl) {
+      this.showToast('Please configure Google Sheets URL first', 'error');
+      return;
+    }
+
+    const confirmed = await this.confirm(
+      'Smart Sync',
+      `<div class="space-y-2">
+        <p>This will sync <strong>${this.pallets.length} active pallets</strong> to Google Sheets.</p>
+        <p class="text-sm text-gray-600">Missing pallets will be added. Existing pallets will be updated.</p>
+        <p class="text-sm font-semibold text-green-700">✓ Removal history will be preserved</p>
+      </div>
+      <p class="mt-3">Continue?</p>`
+    );
+
+    if (!confirmed) return;
+
+    this.setLoading(true);
+    try {
+      const res = await fetch(`${API_URL}/api/sheets/sync-all`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" }
+      });
+      const data = await res.json();
+      console.log("Sync-all result:", data);
+      this.showToast("Smart sync requested from server.", "success");
+    } catch (e) {
+      console.error(e);
+      this.showToast("Smart sync failed.", "error");
+    } finally {
+      this.setLoading(false);
+    }
+  },
+
+  // =========================
+  // ✅ init (C)
+  // =========================
   async init() {
     this.setLoading(true);
     try {
@@ -191,40 +379,171 @@ const app = {
         this.loadActivity(),
         this.loadCustomers()
       ]);
+
+      // ✅ Load server settings (Google Sheets URL stored on server)
+      await this.loadServerSettings();
+
       this.render();
+
+      // Stamp last updated
+      const last = document.getElementById('wt-last-updated');
+      if (last) last.textContent = new Date().toLocaleTimeString();
+
+      
+      // Close sidebar with Escape
+      if (!this._escBound) {
+        this._escBound = true;
+        document.addEventListener('keydown', (e) => {
+          if (e.key === 'Escape') this.wtCloseSidebar();
+        });
+      }
+
+      // Connect to WebSocket for real-time sync
+      this.connectWebSocket();
+
+      // Fallback auto-refresh
+      this.startAutoRefresh();
     } catch (e) {
+      console.error(e);
       this.showToast('Error loading data. Please refresh the page.', 'error');
     } finally {
       this.setLoading(false);
     }
   },
-  
+
+  startAutoRefresh() {
+    if (this._autoRefreshTimer) return;
+
+    const refresh = async () => {
+      try {
+        if (document.hidden) return;
+
+        await Promise.all([
+          this.loadPallets(),
+          this.loadStats(),
+          this.loadActivity()
+        ]);
+
+        // ✅ Re-render on any data-driven page (tracker/history/dashboard)
+        if (this.view === 'tracker' || this.view === 'history' || this.view === 'dashboard') {
+          this.render();
+          if (this.view === 'dashboard') {
+            setTimeout(() => this.initCharts(), 50);
+          }
+        }
+
+        const el = document.getElementById('last-updated');
+        if (el) el.textContent = `Last updated: ${new Date().toLocaleTimeString()}`;
+      } catch (err) {
+        console.error('Auto-refresh failed:', err);
+      }
+    };
+
+    refresh();
+    this._autoRefreshTimer = setInterval(refresh, 5000);
+    console.log('🔄 Auto-refresh enabled (5s)');
+  },
+
+  stopAutoRefresh() {
+    if (this._autoRefreshTimer) {
+      clearInterval(this._autoRefreshTimer);
+      this._autoRefreshTimer = null;
+      console.log('⏹️ Auto-refresh stopped');
+    }
+  },
+
+  // =========================
+  // ✅ WebSocket connect (D)
+  // =========================
+connectWebSocket() {
+    try {
+      if (!window.io) {
+        console.warn('Socket.IO client not loaded');
+        this.updateConnectionUI('is-warn', 'No socket library');
+        const foot = document.getElementById('wt-foot-text');
+        if (foot) foot.textContent = 'No socket library';
+        return;
+      }
+
+      // Reuse existing socket if possible
+      if (this.socket && this.socket.connected) return;
+
+      this.updateConnectionUI('is-warn', 'Connecting…');
+      const foot = document.getElementById('wt-foot-text');
+      if (foot) foot.textContent = 'Connecting…';
+
+      this.socket = io();
+
+      this.socket.on('connect', () => {
+        console.log('✅ WebSocket connected');
+        this.updateConnectionUI('is-ok', 'Live sync connected');
+        const foot2 = document.getElementById('wt-foot-text');
+        if (foot2) foot2.textContent = 'Live sync connected';
+      });
+
+      this.socket.on('connect_error', (err) => {
+        console.warn('⚠️ WebSocket connection error:', err?.message || err);
+        this.updateConnectionUI('is-bad', 'Connection error');
+        const foot2 = document.getElementById('wt-foot-text');
+        if (foot2) foot2.textContent = 'Connection error';
+      });
+
+      this.socket.on('disconnect', () => {
+        console.log('❌ WebSocket disconnected');
+        this.updateConnectionUI('is-warn', 'Live sync disconnected');
+        const foot2 = document.getElementById('wt-foot-text');
+        if (foot2) foot2.textContent = 'Live sync disconnected';
+        this.showToast('Real-time sync disconnected', 'error');
+      });
+
+      this.socket.on('inventory_update', async (update) => {
+        console.log('📡 Received update from another device:', update);
+
+        const { action } = update || {};
+        this.showToast(`Inventory updated (${action || 'update'})`, 'info');
+
+        await Promise.all([
+          this.loadPallets(),
+          this.loadActivityLog(),
+          this.loadStats(),
+          this.loadCustomers()
+        ]);
+
+        // Update last updated stamp
+        const last = document.getElementById('wt-last-updated');
+        if (last) last.textContent = new Date().toLocaleTimeString();
+
+        // Re-render current view (keeps sidebar state)
+        this.render();
+      });
+    } catch (e) {
+      console.warn('Socket init failed', e);
+      this.updateConnectionUI('is-bad', 'Socket init failed');
+      const foot = document.getElementById('wt-foot-text');
+      if (foot) foot.textContent = 'Socket init failed';
+    }
+  },
+
+
   async loadPallets() {
     try {
       let url = `${API_URL}/api/pallets`;
       if (this.selectedCustomer) {
         url += `?customer=${encodeURIComponent(this.selectedCustomer)}`;
       }
-      // Add timestamp to prevent caching
       url += (url.includes('?') ? '&' : '?') + '_t=' + Date.now();
-      
+
       console.log('Loading pallets from:', url);
       const res = await fetch(url, {
         cache: 'no-store',
-        headers: {
-          'Cache-Control': 'no-cache',
-          'Pragma': 'no-cache'
-        }
+        headers: { 'Cache-Control': 'no-cache', 'Pragma': 'no-cache' }
       });
-      
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}: ${res.statusText}`);
-      }
-      
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+
       this.pallets = await res.json();
       console.log('Loaded pallets:', this.pallets.length, 'pallets');
-      
-      // Log the specific pallet quantities for debugging
+
       if (this.pallets.length > 0) {
         console.log('Sample pallet data:', this.pallets.map(p => ({
           id: p.id,
@@ -239,7 +558,7 @@ const app = {
       throw e;
     }
   },
-  
+
   async loadCustomers() {
     try {
       const res = await fetch(`${API_URL}/api/customers`);
@@ -248,7 +567,7 @@ const app = {
       console.error('Error loading customers:', e);
     }
   },
-  
+
   async loadLocations() {
     try {
       const res = await fetch(`${API_URL}/api/locations`);
@@ -258,80 +577,73 @@ const app = {
       throw e;
     }
   },
-  
+
   async loadStats() {
     try {
       let url = `${API_URL}/api/stats`;
       if (this.selectedCustomer) {
         url += `?customer=${encodeURIComponent(this.selectedCustomer)}`;
       }
-      const res = await fetch(url);
+      const res = await fetch(url, { cache: "no-store" });
       this.stats = await res.json();
     } catch (e) {
       console.error('Error loading stats:', e);
       throw e;
     }
   },
-  
+
   async loadActivity() {
     try {
       let url = `${API_URL}/api/activity?limit=100`;
       if (this.selectedCustomer) {
         url += `&customer=${encodeURIComponent(this.selectedCustomer)}`;
       }
-      const res = await fetch(url);
+      const res = await fetch(url, { cache: "no-store" });
       this.activityLog = await res.json();
     } catch (e) {
       console.error('Error loading activity:', e);
       throw e;
     }
   },
-  
+
   // ENHANCED: Check in with support for multiple parts per pallet and scanned by tracking
   async checkIn(customerName, productId, palletQuantity, productQuantity, location, parts = null, scannedBy = 'Unknown') {
     this.setLoading(true);
     try {
-      const payload = { 
-        customer_name: customerName, 
-        product_id: productId, 
+      const payload = {
+        customer_name: customerName,
+        product_id: productId,
         pallet_quantity: palletQuantity,
         product_quantity: productQuantity,
         location,
         scanned_by: scannedBy
       };
-      
-      // Add parts list if provided
-      if (parts) {
-        payload.parts = parts;
-      }
-      
+
+      if (parts) payload.parts = parts;
+
       const res = await fetch(`${API_URL}/api/pallets`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
+
       const data = await res.json();
       this.showToast(data.message || `Checked in by ${scannedBy}`, 'success');
-      
-      if (this.googleSheetsUrl) {
-        await this.syncToGoogleSheets('add_pallet', {
-          customer_name: customerName,
-          product_id: productId,
-          pallet_quantity: palletQuantity,
-          product_quantity: productQuantity,
-          current_units: productQuantity, // Starts at full capacity
-          location: location,
-          parts: parts,
-          scanned_by: scannedBy,
-          date_added: new Date().toISOString()
-        });
-      }
-      
+
+      // ✅ Sheets now syncs on the SERVER (nothing needed here)
+
+      console.log('===== RELOADING DATA AFTER CHECK-IN =====');
+      await new Promise(resolve => setTimeout(resolve, 200));
+      this.pallets = [];
+
       await this.loadCustomers();
       await this.loadPallets();
       await this.loadStats();
       await this.loadActivity();
+
+      console.log('===== DATA RELOADED, RENDERING =====');
       this.render();
+      console.log('===== UI UPDATED =====');
     } catch (e) {
       this.showToast('Error checking in pallet', 'error');
       console.error(e);
@@ -339,40 +651,32 @@ const app = {
       this.setLoading(false);
     }
   },
-  
+
   async checkOut(palletId, scannedBy = null, skipConfirm = false) {
     if (!skipConfirm) {
       const confirmed = await this.confirm('Remove Pallet', 'Are you sure you want to remove this entire pallet from inventory?');
       if (!confirmed) return;
     }
-    
+
     const pallet = this.pallets.find(p => p.id === palletId);
-    
-    // If scannedBy not provided, ask for it
+
     if (scannedBy === null) {
       const input = await this.prompt('Scanned By', 'Who is checking out this pallet?', '');
       scannedBy = input?.trim() || 'Unknown';
     }
-    
+
     this.setLoading(true);
     try {
-      const res = await fetch(`${API_URL}/api/pallets/${palletId}`, { 
+      const res = await fetch(`${API_URL}/api/pallets/${palletId}`, {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ scanned_by: scannedBy })
       });
       const data = await res.json();
       this.showToast(data.message || `Checked out by ${scannedBy}`, 'success');
-      
-      if (this.googleSheetsUrl && pallet) {
-        await this.syncToGoogleSheets('remove_pallet', {
-          customer_name: pallet.customer_name,
-          product_id: pallet.product_id,
-          location: pallet.location,
-          scanned_by: scannedBy
-        });
-      }
-      
+
+      // ✅ Sheets now syncs on the SERVER
+
       await this.loadPallets();
       await this.loadStats();
       await this.loadActivity();
@@ -384,7 +688,7 @@ const app = {
       this.setLoading(false);
     }
   },
-  
+
   // ENHANCED: Remove partial pallets
   async removePartialQuantity(palletId, qtyToRemove = null, scannedBy = null) {
     const pallet = this.pallets.find(p => p.id === palletId);
@@ -392,7 +696,7 @@ const app = {
       this.showToast('Pallet not found', 'error');
       return;
     }
-    
+
     console.log('BEFORE REMOVAL - Pallet state:', {
       id: pallet.id,
       product_id: pallet.product_id,
@@ -400,96 +704,69 @@ const app = {
       product_quantity: pallet.product_quantity,
       total_units: pallet.pallet_quantity * pallet.product_quantity
     });
-    
-    // If quantity not provided, ask for it
+
     if (qtyToRemove === null) {
       const input = await this.prompt(
         'Remove Pallets',
         `Current pallet quantity: <strong>${pallet.pallet_quantity}</strong><br><br>How many pallets to remove?`,
         '1'
       );
-      
       if (input === null) return;
       qtyToRemove = parseInt(input);
     }
-    
+
     const qty = qtyToRemove;
     if (isNaN(qty) || qty <= 0) {
       this.showToast('Please enter a valid quantity', 'error');
       return;
     }
-    
+
     if (qty > pallet.pallet_quantity) {
       this.showToast(`Cannot remove ${qty} pallets. Only ${pallet.pallet_quantity} available.`, 'error');
       return;
     }
-    
-    // If scannedBy not provided, ask for it
+
     if (scannedBy === null) {
       const input = await this.prompt('Scanned By', 'Who is removing these pallets?', '');
       scannedBy = input?.trim() || 'Unknown';
     }
-    
+
     this.setLoading(true);
     try {
       console.log('===== STARTING PALLET REMOVAL =====');
       console.log('Removing pallets:', qty, 'from pallet:', pallet.id, 'by:', scannedBy);
+
       const res = await fetch(`${API_URL}/api/pallets/${palletId}/remove-quantity`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ quantity_to_remove: qty, scanned_by: scannedBy })
       });
-      
+
       if (!res.ok) {
         const error = await res.json();
         throw new Error(error.error || 'Server error');
       }
-      
+
       const data = await res.json();
       console.log('===== SERVER RESPONSE =====');
       console.log('Full response:', data);
       this.showToast(data.message || `Removed by ${scannedBy}`, 'success');
-      
-      if (this.googleSheetsUrl) {
-        console.log('===== SYNCING TO GOOGLE SHEETS =====');
-        const newQuantity = pallet.pallet_quantity - qty;
-        if (newQuantity === 0) {
-          await this.syncToGoogleSheets('remove_pallet', {
-            customer_name: pallet.customer_name,
-            product_id: pallet.product_id,
-            location: pallet.location,
-            scanned_by: scannedBy
-          });
-        } else {
-          await this.syncToGoogleSheets('update_quantity', {
-            customer_name: pallet.customer_name,
-            product_id: pallet.product_id,
-            location: pallet.location,
-            new_quantity: newQuantity,
-            scanned_by: scannedBy
-          });
-        }
-        console.log('Google Sheets sync complete');
-      }
-      
-      // Reload data with cache busting
+
+      // ✅ Sheets now syncs on the SERVER
+
       console.log('===== RELOADING DATA =====');
-      console.log('Waiting 200ms for database to settle...');
       await new Promise(resolve => setTimeout(resolve, 200));
-      
-      console.log('Clearing cached data...');
       this.pallets = [];
-      
-      console.log('Fetching fresh data...');
+
       await Promise.all([
         this.loadPallets(),
         this.loadStats(),
         this.loadActivity()
       ]);
-      
+
       console.log('===== DATA RELOADED =====');
       console.log('Total pallets:', this.pallets.length);
-      
+
       const updatedPallet = this.pallets.find(p => p.id === pallet.id);
       if (updatedPallet) {
         console.log('===== FOUND UPDATED PALLET =====');
@@ -501,7 +778,7 @@ const app = {
       } else {
         console.log('===== PALLET REMOVED =====');
       }
-      
+
       this.render();
       console.log('===== RENDER COMPLETE =====');
     } catch (e) {
@@ -511,7 +788,7 @@ const app = {
       this.setLoading(false);
     }
   },
-  
+
   // NEW: Remove partial units from pallet (for individual parts/items)
   async removePartialUnits(palletId, unitsToRemove = null, scannedBy = null) {
     const pallet = this.pallets.find(p => p.id === palletId || p.product_id === palletId);
@@ -519,15 +796,15 @@ const app = {
       this.showToast('Pallet not found', 'error');
       return;
     }
-    
+
     if (!pallet.product_quantity || pallet.product_quantity === 0) {
       this.showToast('This pallet does not track individual units. Use "Remove Pallets" instead.', 'error');
       return;
     }
-    
+
     const currentUnits = pallet.current_units || (pallet.pallet_quantity * pallet.product_quantity);
     const totalUnits = pallet.pallet_quantity * currentUnits;
-    
+
     console.log('BEFORE REMOVAL - Pallet state:', {
       id: pallet.id,
       product_id: pallet.product_id,
@@ -536,8 +813,7 @@ const app = {
       current_units: currentUnits,
       total_units: totalUnits
     });
-    
-    // If unitsToRemove not provided, ask for it
+
     if (unitsToRemove === null) {
       const input = await this.prompt(
         'Remove Units',
@@ -549,125 +825,70 @@ const app = {
         <p class="mt-3">How many units to remove?</p>`,
         '1'
       );
-      
+
       if (input === null) return;
       unitsToRemove = parseInt(input);
     }
-    
+
     const units = unitsToRemove;
     if (isNaN(units) || units <= 0) {
       this.showToast('Please enter a valid quantity', 'error');
       return;
     }
-    
+
     if (units > totalUnits) {
       this.showToast(`Cannot remove ${units} units. Only ${totalUnits} available.`, 'error');
       return;
     }
-    
-    // If scannedBy not provided, ask for it
+
     if (scannedBy === null) {
       const input = await this.prompt('Scanned By', 'Who is removing these units?', '');
       scannedBy = input?.trim() || 'Unknown';
     }
-    
+
     this.setLoading(true);
     try {
       console.log('===== STARTING UNIT REMOVAL =====');
       console.log('Removing units:', units, 'from pallet:', pallet.id, 'by:', scannedBy);
-      
+
       const res = await fetch(`${API_URL}/api/pallets/${pallet.id}/remove-units`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
+        body: JSON.stringify({
           units_to_remove: units,
           scanned_by: scannedBy
         })
       });
-      
+
       if (!res.ok) {
         const error = await res.json();
         throw new Error(error.error || 'Server error');
       }
-      
+
       const data = await res.json();
       console.log('===== SERVER RESPONSE =====');
       console.log('Full response:', data);
-      console.log('Updated pallet should be:', data.updated_pallet);
-      
-      // Sync to Google Sheets
-      if (this.googleSheetsUrl) {
-        console.log('===== SYNCING TO GOOGLE SHEETS =====');
-        const newPalletQty = data.pallets_remaining;
-        if (newPalletQty === 0) {
-          await this.syncToGoogleSheets('remove_pallet', {
-            customer_name: pallet.customer_name,
-            product_id: pallet.product_id,
-            location: pallet.location
-          });
-        } else {
-          await this.syncToGoogleSheets('units_remove', {
-            customer_name: pallet.customer_name,
-            product_id: pallet.product_id,
-            location: pallet.location,
-            units_removed: units,
-            new_pallet_quantity: newPalletQty,
-            units_per_pallet: pallet.product_quantity,
-            scanned_by: scannedBy
-          });
-        }
-        console.log('Google Sheets sync complete');
-      }
-      
-      // Show success message
+
+      // ✅ Sheets now syncs on the SERVER
+
       this.showToast(data.message || `Removed by ${scannedBy}`, 'success');
-      
-      // Force reload with delay and cache busting
+
       console.log('===== RELOADING DATA =====');
-      console.log('Waiting 200ms for database to settle...');
       await new Promise(resolve => setTimeout(resolve, 200));
-      
-      console.log('Clearing cached data...');
-      this.pallets = []; // Clear cache
-      
-      console.log('Fetching fresh data...');
+      this.pallets = [];
+
       await Promise.all([
         this.loadPallets(),
         this.loadStats(),
         this.loadActivity()
       ]);
-      
+
       console.log('===== DATA RELOADED =====');
       console.log('Total pallets loaded:', this.pallets.length);
-      console.log('All pallet data:', this.pallets.map(p => ({
-        id: p.id,
-        product_id: p.product_id,
-        pallet_qty: p.pallet_quantity,
-        product_qty: p.product_quantity,
-        total_units: p.pallet_quantity * p.product_quantity
-      })));
-      
-      // Find the updated pallet
-      const updatedPallet = this.pallets.find(p => p.id === pallet.id);
-      if (updatedPallet) {
-        console.log('===== FOUND UPDATED PALLET =====');
-        console.log('Updated pallet data:', {
-          id: updatedPallet.id,
-          product_id: updatedPallet.product_id,
-          pallet_quantity: updatedPallet.pallet_quantity,
-          product_quantity: updatedPallet.product_quantity,
-          total_units: updatedPallet.pallet_quantity * updatedPallet.product_quantity
-        });
-      } else {
-        console.log('===== PALLET REMOVED FROM INVENTORY =====');
-        console.log('Pallet', pallet.id, 'is no longer in active inventory (quantity reached 0)');
-      }
-      
-      // Force re-render
-      console.log('===== FORCING RE-RENDER =====');
+
       this.render();
       console.log('===== RENDER COMPLETE =====');
-      
+
     } catch (e) {
       console.error('===== ERROR REMOVING UNITS =====', e);
       this.showToast('Error removing units: ' + e.message, 'error');
@@ -675,7 +896,18 @@ const app = {
       this.setLoading(false);
     }
   },
-  
+
+
+  // Compatibility aliases (older instructions referenced these names)
+  removeUnits(palletId) {
+    return this.removePartialUnits(palletId);
+  },
+
+  _startQrReader(mode) {
+    // Older builds used this; we now use startScanner().
+    return this.startScanner(mode);
+  },
+
   // NEW: Show detailed product information including removal history
   async showProductInfo(palletId) {
     const pallet = this.pallets.find(p => p.id === palletId);
@@ -683,21 +915,20 @@ const app = {
       this.showToast('Pallet not found', 'error');
       return;
     }
-    
-    // Get removal history for this pallet from activity log
-    const removalHistory = this.activityLog.filter(a => 
-      a.product_id === pallet.product_id && 
+
+    const removalHistory = this.activityLog.filter(a =>
+      a.product_id === pallet.product_id &&
       a.location === pallet.location &&
       (a.action === 'PARTIAL_REMOVE' || a.action === 'UNITS_REMOVE')
     );
-    
+
     const totalUnits = pallet.current_units || (pallet.pallet_quantity * pallet.product_quantity);
-    
+
     const content = `
       <div class="space-y-4">
         <div class="bg-gradient-to-r from-blue-50 to-blue-100 p-4 rounded-lg border-l-4 border-blue-500">
           <h4 class="font-bold text-lg text-gray-900 mb-3">${pallet.product_id}</h4>
-          
+
           <div class="grid grid-cols-2 gap-3 text-sm">
             <div>
               <span class="text-gray-600">Customer:</span>
@@ -730,7 +961,7 @@ const app = {
               <span class="font-bold ml-2 text-green-600">👤 ${pallet.scanned_by || 'Unknown'}</span>
             </div>
           </div>
-          
+
           ${pallet.parts && pallet.parts.length > 0 ? `
             <div class="mt-4 p-3 bg-white rounded-lg">
               <p class="text-sm font-semibold text-gray-700 mb-2">📋 Parts List:</p>
@@ -745,7 +976,7 @@ const app = {
             </div>
           ` : ''}
         </div>
-        
+
         ${removalHistory.length > 0 ? `
           <div>
             <h5 class="font-bold text-gray-900 mb-2 flex items-center gap-2">
@@ -786,11 +1017,11 @@ const app = {
             ✓ No removals yet - full original quantity
           </div>
         `}
-        
+
         <div class="pt-3 border-t border-gray-200">
           <p class="text-xs text-gray-500 mb-3">Need to remove this pallet completely?</p>
-          <button 
-            onclick="app.closeModal(); app.checkOut('${pallet.id}')" 
+          <button
+            onclick="app.closeModal(); app.checkOut('${pallet.id}')"
             class="w-full bg-red-500 text-white px-4 py-2 rounded-lg font-semibold hover:bg-red-600"
           >
             🗑️ Remove All (Complete Checkout)
@@ -798,24 +1029,24 @@ const app = {
         </div>
       </div>
     `;
-    
+
     await this.showModal('Product Information', content, [
       { text: 'Close', value: 'close' }
     ]);
   },
-  
+
   startScanner(mode) {
     this.scanMode = mode;
     this.render();
-    
+
     setTimeout(() => {
       const html5QrCode = new Html5Qrcode("qr-reader");
       this.scanner = html5QrCode;
-      
+
       Html5Qrcode.getCameras().then(cameras => {
         if (cameras && cameras.length > 0) {
           const cameraId = cameras.length > 1 ? cameras[1].id : cameras[0].id;
-          
+
           html5QrCode.start(
             cameraId,
             { fps: 10, qrbox: { width: 250, height: 250 }, aspectRatio: 1.0 },
@@ -823,7 +1054,7 @@ const app = {
               this.handleScan(decodedText);
               html5QrCode.stop().catch(err => console.log('Stop error:', err));
             },
-            (errorMessage) => {}
+            () => {}
           ).catch(err => {
             console.error("Camera start error:", err);
             this.showToast("Camera access denied. Please enable camera permissions.", 'error');
@@ -846,19 +1077,14 @@ const app = {
       });
     }, 100);
   },
-  
+
   async handleScan(code) {
-    // Try to parse as JSON (new pallet QR with embedded data)
     let palletData = null;
     try {
       const parsed = JSON.parse(code);
-      if (parsed.type === 'PALLET') {
-        palletData = parsed;
-      }
-    } catch (e) {
-      // Not JSON, treat as simple ID
-    }
-    
+      if (parsed.type === 'PALLET') palletData = parsed;
+    } catch (_) {}
+
     if (this.scanMode === 'checkin-pallet') {
       this.tempPallet = palletData || code;
       this.stopScanner();
@@ -867,12 +1093,47 @@ const app = {
         this.scanMode = 'checkin-location';
         this.startScanner('checkin-location');
       }, 500);
-      
+
     } else if (this.scanMode === 'checkin-location') {
       this.stopScanner();
-      
-      // If we have full pallet data from QR, just ask for "scanned by"
+
       if (this.tempPallet && typeof this.tempPallet === 'object' && this.tempPallet.customer) {
+        const palletsInThisLocation = await this.prompt(
+          'Pallets for This Location',
+          `<div class="space-y-2">
+            <p><strong>Product:</strong> ${this.tempPallet.product}</p>
+            <p><strong>Customer:</strong> ${this.tempPallet.customer}</p>
+            <p><strong>Location:</strong> ${code}</p>
+            <p class="text-sm text-gray-600 mt-3">QR code says ${this.tempPallet.palletQty} pallet(s) total</p>
+          </div>
+          <p class="font-semibold mt-3">How many pallets are you putting in THIS location?</p>`,
+          this.tempPallet.palletQty.toString()
+        );
+
+        if (palletsInThisLocation === null) {
+          this.scanMode = null;
+          this.tempPallet = null;
+          this.render();
+          return;
+        }
+
+        const qtyForThisLocation = parseInt(palletsInThisLocation);
+        if (isNaN(qtyForThisLocation) || qtyForThisLocation <= 0) {
+          this.showToast('Please enter a valid quantity', 'error');
+          this.scanMode = null;
+          this.tempPallet = null;
+          this.render();
+          return;
+        }
+
+        if (qtyForThisLocation > this.tempPallet.palletQty) {
+          this.showToast(`Cannot put ${qtyForThisLocation} pallets - QR only has ${this.tempPallet.palletQty}`, 'error');
+          this.scanMode = null;
+          this.tempPallet = null;
+          this.render();
+          return;
+        }
+
         const scannedBy = await this.prompt('Scanned By', 'Who is checking in this pallet?', '');
         if (scannedBy === null) {
           this.scanMode = null;
@@ -880,22 +1141,40 @@ const app = {
           this.render();
           return;
         }
-        
-        // Use all data from QR code
-        this.checkIn(
-          this.tempPallet.customer, 
-          this.tempPallet.product, 
-          this.tempPallet.palletQty, 
-          this.tempPallet.productQty, 
-          code, // location
+
+        await this.checkIn(
+          this.tempPallet.customer,
+          this.tempPallet.product,
+          qtyForThisLocation,
+          this.tempPallet.productQty,
+          code,
           this.tempPallet.parts,
           scannedBy.trim() || 'Unknown'
         );
+
+        const remaining = this.tempPallet.palletQty - qtyForThisLocation;
+        if (remaining > 0) {
+          const continueScanning = await this.confirm(
+            'More Pallets?',
+            `<div class="space-y-2">
+              <p>✅ Checked in <strong>${qtyForThisLocation} pallet(s)</strong> at ${code}</p>
+              <p class="text-lg font-bold text-orange-600">⚠️ ${remaining} pallet(s) remaining</p>
+            </div>
+            <p class="mt-3">Do you want to scan another location for the remaining pallets?</p>`
+          );
+
+          if (continueScanning) {
+            this.tempPallet.palletQty = remaining;
+            this.scanMode = 'checkin-location';
+            this.startScanner('checkin-location');
+            return;
+          }
+        }
+
         this.scanMode = null;
         this.tempPallet = null;
-        
+
       } else {
-        // Old workflow - ask for all details
         const customerName = await this.prompt('Customer Name', 'Enter customer name:');
         if (!customerName) {
           this.scanMode = null;
@@ -903,7 +1182,7 @@ const app = {
           this.render();
           return;
         }
-        
+
         const palletQty = await this.prompt('Pallet Quantity', 'How many pallets?', '1');
         if (palletQty === null) {
           this.scanMode = null;
@@ -911,7 +1190,7 @@ const app = {
           this.render();
           return;
         }
-        
+
         const productQty = await this.prompt('Product Quantity (Optional)', 'Units per pallet (leave blank if not tracking):', '0');
         if (productQty === null) {
           this.scanMode = null;
@@ -919,103 +1198,84 @@ const app = {
           this.render();
           return;
         }
-        
+
         const addParts = await this.confirm('Add Parts List', 'Would you like to add a detailed parts list for this pallet?');
         let parts = null;
-        
+
         if (addParts) {
           const partsList = await this.promptMultiline(
             'Parts List',
             'Enter parts for this pallet (one per line):',
             ''
           );
-          
+
           if (partsList && partsList.trim()) {
             parts = this.parsePartsList(partsList);
           }
         }
-        
+
         const scannedBy = await this.prompt('Scanned By', 'Who is checking in this pallet?', '');
-        
+
         this.checkIn(customerName, this.tempPallet, parseInt(palletQty) || 1, parseInt(productQty) || 0, code, parts, scannedBy?.trim() || 'Unknown');
         this.scanMode = null;
         this.tempPallet = null;
       }
-      
+
     } else if (this.scanMode === 'checkout') {
+      // Checkout = remove the entire pallet entry
+      const palletId = decodedText.trim();
       this.stopScanner();
-      
-      // Parse pallet data if it's a JSON QR
-      const palletId = palletData ? palletData.id : code;
-      
-      // Find the pallet
-      const pallet = this.pallets.find(p => p.id === palletId || p.product_id === palletId);
-      if (!pallet) {
-        this.showToast('Pallet not found in inventory', 'error');
-        this.scanMode = null;
-        this.render();
-        return;
-      }
-      
-      // Ask for pallet quantity to remove
-      const qtyToRemove = await this.prompt(
-        'Check Out Pallets',
-        `<div class="mb-3">
-          <p class="font-bold text-lg mb-2">${pallet.product_id}</p>
-          <p class="text-sm text-gray-600">Customer: ${pallet.customer_name}</p>
-          <p class="text-sm text-gray-600">Location: ${pallet.location}</p>
-          <p class="text-sm font-semibold mt-2">Available: ${pallet.pallet_quantity} pallet(s)</p>
-        </div>
-        <p class="font-semibold">How many pallets to check out?</p>`,
-        pallet.pallet_quantity.toString()
-      );
-      
-      if (qtyToRemove === null) {
-        this.scanMode = null;
-        return;
-      }
-      
-      // Ask who is checking out
-      const scannedBy = await this.prompt('Scanned By', 'Who is checking out this pallet?', '');
-      if (scannedBy === null) {
-        this.scanMode = null;
-        return;
-      }
-      
-      const qty = parseInt(qtyToRemove);
-      if (qty >= pallet.pallet_quantity) {
-        // Complete checkout
-        await this.checkOut(palletId, scannedBy?.trim() || 'Unknown', true);
-      } else {
-        // Partial checkout
-        await this.removePartialQuantity(palletId, qty, scannedBy?.trim() || 'Unknown');
-      }
-      
       this.scanMode = null;
-      
-    } else if (this.scanMode === 'checkout-units') {
+
+      const pallet = this.pallets.find(p => String(p.id) === String(palletId));
+      if (!pallet) {
+        alert('Pallet not found: ' + palletId);
+        this.render();
+        return;
+      }
+
+      const ok = confirm(`Check out pallet ${pallet.product_id || palletId} at ${pallet.location || ''}?`);
+      if (!ok) {
+        this.render();
+        return;
+      }
+
+      try {
+        await fetch(`${API_URL}/api/pallets/${encodeURIComponent(palletId)}/checkout`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ scanned_by: 'scanner' })
+        });
+        await this.refreshAll();
+        this.setView('history');
+      } catch (err) {
+        console.error(err);
+        alert('Checkout failed.');
+        this.render();
+      }
+      return;
+    }
+
+    if (this.scanMode === 'checkout-units') {
       this.stopScanner();
-      
-      // Parse pallet data if it's a JSON QR
+
       const palletId = palletData ? palletData.id : code;
-      
-      // Find the pallet
       const pallet = this.pallets.find(p => p.id === palletId || p.product_id === palletId);
+
       if (!pallet) {
         this.showToast('Pallet not found in inventory', 'error');
         this.scanMode = null;
         this.render();
         return;
       }
-      
+
       if (!pallet.product_quantity || pallet.product_quantity === 0) {
         this.showToast('This pallet does not track individual units. Use "Check Out Pallet" instead.', 'error');
         this.scanMode = null;
         this.render();
         return;
       }
-      
-      // Show pallet info and ask for units to remove
+
       const currentUnits = pallet.current_units || (pallet.pallet_quantity * pallet.product_quantity);
       const unitsToRemove = await this.prompt(
         'Check Out Units',
@@ -1028,37 +1288,35 @@ const app = {
         <p class="font-semibold">How many units to check out?</p>`,
         '1'
       );
-      
+
       if (unitsToRemove === null) {
         this.scanMode = null;
         return;
       }
-      
-      // Ask who is checking out
+
       const scannedBy = await this.prompt('Scanned By', 'Who is checking out these units?', '');
       if (scannedBy === null) {
         this.scanMode = null;
         return;
       }
-      
+
       await this.removePartialUnits(palletId, parseInt(unitsToRemove), scannedBy?.trim() || 'Unknown');
       this.scanMode = null;
     }
   },
-  
+
   // NEW: Parse parts list from text input
   parsePartsList(text) {
     const lines = text.split('\n').filter(line => line.trim());
     const parts = [];
-    
+
     for (const line of lines) {
       const trimmed = line.trim();
       if (!trimmed) continue;
-      
-      // Try to parse format: "Part Number | Quantity" or "Part Number, Quantity"
+
       const separators = ['|', ',', '\t'];
       let parsed = false;
-      
+
       for (const sep of separators) {
         if (trimmed.includes(sep)) {
           const [partNum, qty] = trimmed.split(sep).map(s => s.trim());
@@ -1072,8 +1330,7 @@ const app = {
           }
         }
       }
-      
-      // If no separator found, just use the whole line as part number
+
       if (!parsed) {
         parts.push({
           part_number: trimmed,
@@ -1081,10 +1338,10 @@ const app = {
         });
       }
     }
-    
+
     return parts.length > 0 ? parts : null;
   },
-  
+
   stopScanner() {
     if (this.scanner) {
       try {
@@ -1099,55 +1356,179 @@ const app = {
       this.scanner = null;
     }
   },
-  
+
   // ENHANCED: Manual entry with parts support
-  async showManualEntry() {
-    const customerName = await this.prompt('Customer Name', 'Enter customer name (e.g., Godbold, Council):');
-    if (customerName === null) return;
-    if (!customerName.trim()) {
-      this.showToast('Customer name is required', 'error');
+  showManualEntry() {
+  // Ensure modal + toast containers exist (in case renderShell didn't create them yet)
+  this._ensureUiOverlays();
+
+  const partsHelp = `Optional parts list (one per line):
+PART-001 x 10
+PART-ABC x2`;
+
+  const html = `
+    <div class="space-y-4">
+      <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <div>
+          <label class="block text-sm font-semibold text-slate-700 mb-1">Customer</label>
+          <input id="me_customer" class="w-full rounded-xl border border-slate-300 px-3 py-2" placeholder="e.g. COUNCIL" />
+        </div>
+        <div>
+          <label class="block text-sm font-semibold text-slate-700 mb-1">Product ID</label>
+          <input id="me_product" class="w-full rounded-xl border border-slate-300 px-3 py-2" placeholder="e.g. 715326" />
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
+        <div>
+          <label class="block text-sm font-semibold text-slate-700 mb-1">Pallet qty</label>
+          <input id="me_palletQty" type="number" min="1" value="1"
+            class="w-full rounded-xl border border-slate-300 px-3 py-2" />
+        </div>
+        <div>
+          <label class="block text-sm font-semibold text-slate-700 mb-1">Units / pallet</label>
+          <input id="me_unitsPer" type="number" min="0" value="0"
+            class="w-full rounded-xl border border-slate-300 px-3 py-2" />
+        </div>
+        <div>
+          <label class="block text-sm font-semibold text-slate-700 mb-1">Location</label>
+          <input id="me_location" class="w-full rounded-xl border border-slate-300 px-3 py-2" placeholder="e.g. A1-L3" />
+        </div>
+      </div>
+
+      <div>
+        <label class="block text-sm font-semibold text-slate-700 mb-1">Parts list (optional)</label>
+        <textarea id="me_parts" rows="5"
+          class="w-full rounded-xl border border-slate-300 px-3 py-2 font-mono text-sm"
+          placeholder="${partsHelp.replaceAll('"', '&quot;')}"></textarea>
+        <div class="mt-2 text-xs text-slate-500">${partsHelp.replaceAll('\n', '<br/>')}</div>
+      </div>
+
+      <div class="rounded-xl bg-slate-50 p-3 text-sm text-slate-600">
+        This will create a new pallet record (same as scanning a pallet check-in).
+      </div>
+    </div>
+  `;
+
+  this.showModal("Manual entry", html, [
+    { label: "Cancel", value: null, style: "secondary" },
+    { label: "Save", value: "save", style: "primary" },
+  ]).then(async (result) => {
+    if (result !== "save") return;
+
+    const customer = (document.getElementById("me_customer")?.value || "").trim();
+    const product = (document.getElementById("me_product")?.value || "").trim();
+    const location = (document.getElementById("me_location")?.value || "").trim();
+
+    const palletQty = parseInt(document.getElementById("me_palletQty")?.value || "1", 10);
+    const unitsPer = parseInt(document.getElementById("me_unitsPer")?.value || "0", 10);
+
+    const partsRaw = (document.getElementById("me_parts")?.value || "").trim();
+    const parts = this._parsePartsList(partsRaw);
+
+    if (!customer || !product || !location) {
+      this.showToast("Customer, Product ID and Location are required.", "error");
       return;
     }
-    
-    const productId = await this.prompt('Product ID', 'Enter product ID:');
-    if (productId === null) return;
-    if (!productId.trim()) {
-      this.showToast('Product ID is required', 'error');
+    if (!Number.isFinite(palletQty) || palletQty <= 0) {
+      this.showToast("Pallet qty must be 1 or more.", "error");
       return;
     }
-    
-    const palletQuantity = await this.prompt('Pallet Quantity', 'How many pallets?', '1');
-    if (palletQuantity === null) return;
-    
-    const productQuantity = await this.prompt('Product Quantity (Optional)', 'Units per pallet (leave blank if not tracking):', '0');
-    if (productQuantity === null) return;
-    
-    const location = await this.prompt('Location', 'Enter location (e.g., A1-L3):');
-    if (location === null) return;
-    if (!location.trim()) {
-      this.showToast('Location is required', 'error');
+    if (!Number.isFinite(unitsPer) || unitsPer < 0) {
+      this.showToast("Units/pallet must be 0 or more.", "error");
       return;
     }
-    
-    // NEW: Ask if they want to add a parts list
-    const addParts = await this.confirm('Add Parts List', 'Would you like to add a detailed parts list for this pallet?');
-    let parts = null;
-    
-    if (addParts) {
-      const partsList = await this.promptMultiline(
-        'Parts List',
-        'Enter parts for this pallet (one per line):',
-        ''
-      );
-      
-      if (partsList && partsList.trim()) {
-        parts = this.parsePartsList(partsList);
+
+    try {
+      await this.apiPost("/api/pallets", {
+        customer_name: customer,
+        product_id: product,
+        pallet_quantity: palletQty,
+        product_quantity: unitsPer,
+        location,
+        parts: parts.length ? parts : null,
+        scanned_by: "Manual entry",
+      });
+
+      this.showToast("Saved ✅", "success");
+
+      // Refresh local state
+      await Promise.allSettled([
+        this.loadPallets?.(),
+        this.loadActivity?.(),
+        this.loadStats?.(),
+        this.loadLocations?.(),
+      ]);
+
+      this.setView?.("tracker");
+      this.render?.();
+    } catch (e) {
+      this.showToast(e?.message || "Save failed", "error");
+    }
+  });
+},
+
+_ensureUiOverlays() {
+  // modal root
+  if (!document.getElementById("modal-root")) {
+    const mr = document.createElement("div");
+    mr.id = "modal-root";
+    document.body.appendChild(mr);
+  }
+  // toast container
+  if (!document.getElementById("toast-container")) {
+    const tc = document.createElement("div");
+    tc.id = "toast-container";
+    document.body.appendChild(tc);
+  }
+},
+
+_parsePartsList(text) {
+  if (!text) return [];
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+
+  // Accept formats:
+  // PART-001 x 10
+  // PART-001 x10
+  // PART-001,10
+  // PART-001 10
+  const parts = [];
+  for (const line of lines) {
+    let part_number = "";
+    let quantity = 1;
+
+    // Try "x"
+    const xMatch = line.match(/^(.+?)\s*x\s*(\d+)$/i);
+    if (xMatch) {
+      part_number = xMatch[1].trim();
+      quantity = parseInt(xMatch[2], 10);
+    } else {
+      // Try comma
+      const cMatch = line.match(/^(.+?),\s*(\d+)$/);
+      if (cMatch) {
+        part_number = cMatch[1].trim();
+        quantity = parseInt(cMatch[2], 10);
+      } else {
+        // Try space split last token as number
+        const sMatch = line.match(/^(.+?)\s+(\d+)$/);
+        if (sMatch) {
+          part_number = sMatch[1].trim();
+          quantity = parseInt(sMatch[2], 10);
+        } else {
+          part_number = line.trim();
+          quantity = 1;
+        }
       }
     }
-    
-    this.checkIn(customerName.trim(), productId.trim(), parseInt(palletQuantity) || 1, parseInt(productQuantity) || 0, location.trim(), parts);
-  },
-  
+
+    if (!part_number) continue;
+    if (!Number.isFinite(quantity) || quantity <= 0) quantity = 1;
+
+    parts.push({ part_number, quantity });
+  }
+  return parts;
+},
+
   async generateQRCode(text, containerId) {
     return new Promise((resolve) => {
       setTimeout(() => {
@@ -1175,97 +1556,90 @@ const app = {
       }, 100);
     });
   },
-  
+
   async generateLocationQRs() {
     this.view = 'location-qrs';
     this.render();
     this.setLoading(true);
-    
+
     setTimeout(async () => {
       const aisles = this.locations.reduce((acc, loc) => {
         if (!acc.includes(loc.aisle)) acc.push(loc.aisle);
         return acc;
       }, []).sort();
-      
+
       for (const aisle of aisles) {
         const aisleLocations = this.locations.filter(l => l.aisle === aisle);
         for (const loc of aisleLocations) {
           await this.generateQRCode(loc.id, `qr-${loc.id}`);
         }
       }
-      
+
       this.setLoading(false);
       this.showToast('All QR codes generated successfully!', 'success');
     }, 200);
   },
-  
+
   async generatePalletQR() {
-    const customerName = await this.prompt('Customer Name', 'Enter customer name:');
-    if (customerName === null || !customerName.trim()) {
-      if (customerName !== null) this.showToast('Customer name is required', 'error');
-      return;
-    }
-    
-    const productDesc = await this.prompt('Product Description', 'Enter product description:');
-    if (productDesc === null || !productDesc.trim()) {
-      if (productDesc !== null) this.showToast('Product description is required', 'error');
-      return;
-    }
-    
-    const palletQuantity = await this.prompt('Pallet Quantity', 'How many pallets?', '1');
-    if (palletQuantity === null) return;
-    
-    const productQuantity = await this.prompt('Units per Pallet', 'Units per pallet (0 if not tracking):', '0');
-    if (productQuantity === null) return;
-    
-    // Ask if they want to add parts list
-    const addParts = await this.confirm('Add Parts List', 'Would you like to add a detailed parts list?');
-    let parts = null;
-    
-    if (addParts) {
-      const partsList = await this.promptMultiline(
-        'Parts List',
-        'Enter parts for this pallet (one per line):\nFormat: Part Number | Quantity',
-        ''
-      );
-      
-      if (partsList && partsList.trim()) {
-        parts = this.parsePartsList(partsList);
-      }
-    }
-    
-    const palletId = `PLT-${Date.now()}`;
-    
-    // Encode all data as JSON in the QR code
-    const qrData = {
-      type: 'PALLET',
-      id: palletId,
-      customer: customerName.trim(),
-      product: productDesc.trim(),
-      palletQty: parseInt(palletQuantity) || 1,
-      productQty: parseInt(productQuantity) || 0,
-      parts: parts
+  try {
+    // Ask for details (simple + reliable)
+    const customer = prompt("Customer name? (required)", "")?.trim();
+    if (!customer) return;
+
+    const product = prompt("Product ID / name? (optional)", "")?.trim() || "";
+    const palletQty = Number(prompt("Pallet quantity? (default 1)", "1") || 1) || 1;
+    const unitsPerPallet = Number(prompt("Units per pallet? (0 if not used)", "0") || 0) || 0;
+
+    // Create a temp pallet payload used by renderSingleQR()
+    const id = `PAL-${Date.now().toString(36).toUpperCase()}`;
+    this.tempPallet = {
+      id,
+      customer,
+      product,
+      palletQty,
+      productQty: unitsPerPallet,
     };
-    
-    this.view = 'single-qr';
-    this.tempPallet = qrData;
+
+    // Go to the existing single-qr screen (it has #single-qr-canvas)
+    this.view = "single-qr";
     this.render();
-    
-    setTimeout(async () => {
-      // Generate QR with JSON data
-      await this.generateQRCode(JSON.stringify(qrData), 'single-qr-canvas');
-      this.showToast('QR code generated with all pallet data!', 'success');
-    }, 100);
-  },
-  
+
+    // Wait for the canvas element to exist, then draw QR into it
+    const waitForEl = (selector, ms = 1500) =>
+      new Promise((resolve, reject) => {
+        const started = Date.now();
+        const tick = () => {
+          const el = document.querySelector(selector);
+          if (el) return resolve(el);
+          if (Date.now() - started > ms) return reject(new Error(`Missing element: ${selector}`));
+          requestAnimationFrame(tick);
+        };
+        tick();
+      });
+
+    const mount = await waitForEl("#single-qr-canvas");
+
+    // Clear and render QR
+    mount.innerHTML = "";
+    // QRCODEJS: new QRCode(element, { text, width, height })
+    new QRCode(mount, {
+      text: id,
+      width: 220,
+      height: 220,
+    });
+  } catch (err) {
+    console.error("generatePalletQR failed:", err);
+    this.showToast?.("QR generation failed — check console for details", "error");
+  }
+},
+
   async reprintPalletQR(palletId) {
     const pallet = this.pallets.find(p => p.id === palletId);
     if (!pallet) {
       this.showToast('Pallet not found', 'error');
       return;
     }
-    
-    // Create QR data with all pallet information
+
     const qrData = {
       type: 'PALLET',
       id: pallet.id,
@@ -1275,22 +1649,21 @@ const app = {
       productQty: pallet.product_quantity,
       parts: pallet.parts
     };
-    
+
     this.view = 'single-qr';
     this.tempPallet = qrData;
     this.render();
-    
+
     setTimeout(async () => {
-      // Generate QR with JSON data
       await this.generateQRCode(JSON.stringify(qrData), 'single-qr-canvas');
       this.showToast('QR code ready to reprint!', 'success');
     }, 100);
   },
-  
+
   printQRCodes() {
     window.print();
   },
-  
+
   initCharts() {
     Object.values(this.charts).forEach(chart => {
       if (chart) chart.destroy();
@@ -1300,7 +1673,7 @@ const app = {
     this.createLocationChart();
     this.createActivityChart();
   },
-  
+
   createCustomerChart() {
     const canvas = document.getElementById('customerChart');
     if (!canvas) return;
@@ -1333,7 +1706,7 @@ const app = {
       }
     });
   },
-  
+
   createLocationChart() {
     const canvas = document.getElementById('locationChart');
     if (!canvas) return;
@@ -1368,7 +1741,7 @@ const app = {
       }
     });
   },
-  
+
   createActivityChart() {
     const canvas = document.getElementById('activityChart');
     if (!canvas) return;
@@ -1380,18 +1753,18 @@ const app = {
       date.setDate(date.getDate() - i);
       const dateStr = date.toISOString().split('T')[0];
       dates.push(date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }));
-      
-      const dayCheckIns = this.activityLog.filter(a => 
+
+      const dayCheckIns = this.activityLog.filter(a =>
         a.timestamp.startsWith(dateStr) && a.action === 'CHECK_IN'
       ).length;
-      const dayCheckOuts = this.activityLog.filter(a => 
+      const dayCheckOuts = this.activityLog.filter(a =>
         a.timestamp.startsWith(dateStr) && (a.action === 'CHECK_OUT' || a.action === 'PARTIAL_REMOVE')
       ).length;
-      
+
       checkIns.push(dayCheckIns);
       checkOuts.push(dayCheckOuts);
     }
-    
+
     this.charts.activity = new Chart(canvas, {
       type: 'line',
       data: {
@@ -1428,102 +1801,17 @@ const app = {
       }
     });
   },
-  
+
   generateColors(count) {
     const colors = [
       'rgba(59, 130, 246, 0.8)', 'rgba(34, 197, 94, 0.8)', 'rgba(239, 68, 68, 0.8)',
       'rgba(234, 179, 8, 0.8)', 'rgba(168, 85, 247, 0.8)', 'rgba(236, 72, 153, 0.8)',
       'rgba(20, 184, 166, 0.8)', 'rgba(249, 115, 22, 0.8)', 'rgba(99, 102, 241, 0.8)'
     ];
-    while (colors.length < count) {
-      colors.push(...colors);
-    }
+    while (colors.length < count) colors.push(...colors);
     return colors.slice(0, count);
   },
-  
-  async syncToGoogleSheets(action, data) {
-    if (!this.googleSheetsUrl) return;
-    
-    try {
-      console.log('===== SYNCING TO GOOGLE SHEETS =====');
-      console.log('Action:', action);
-      console.log('Data being sent:', JSON.stringify(data, null, 2));
-      
-      const response = await fetch(this.googleSheetsUrl, {
-        method: 'POST',
-        mode: 'no-cors',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action, data })
-      });
-      
-      console.log('Sync request sent successfully');
-      
-      // Give Google Sheets time to process
-      await new Promise(resolve => setTimeout(resolve, 500));
-      console.log('===== SYNC COMPLETE =====');
-    } catch (e) {
-      console.error('Google Sheets sync error:', e);
-      // Don't show error to user - sync failures shouldn't block operations
-    }
-  },
-  
-  saveGoogleSheetsUrl(url) {
-    this.googleSheetsUrl = url;
-    localStorage.setItem('googleSheetsUrl', url);
-    this.showToast('Google Sheets URL saved!', 'success');
-  },
-  
-  async testGoogleSheetsConnection() {
-    if (!this.googleSheetsUrl) {
-      this.showToast('Please enter a Google Sheets URL first', 'error');
-      return;
-    }
-    
-    this.setLoading(true);
-    try {
-      await fetch(this.googleSheetsUrl, {
-        method: 'POST',
-        mode: 'no-cors',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'test', data: {} })
-      });
-      this.showToast('Connection test sent! Check your Google Sheet.', 'info');
-    } catch (e) {
-      this.showToast('Connection test failed. Check your URL.', 'error');
-      console.error(e);
-    } finally {
-      this.setLoading(false);
-    }
-  },
-  
-  async syncAllToGoogleSheets() {
-    if (!this.googleSheetsUrl) {
-      this.showToast('Please configure Google Sheets URL first', 'error');
-      return;
-    }
-    
-    this.setLoading(true);
-    try {
-      await this.syncToGoogleSheets('sync_all', {
-        pallets: this.pallets.map(p => ({
-          customer_name: p.customer_name,
-          product_id: p.product_id,
-          location: p.location,
-          pallet_quantity: p.pallet_quantity,
-          product_quantity: p.product_quantity,
-          parts: p.parts,
-          date_added: p.date_added
-        }))
-      });
-      this.showToast('Full sync completed! Check your Google Sheet.', 'success');
-    } catch (e) {
-      this.showToast('Sync failed. Please check your connection.', 'error');
-      console.error(e);
-    } finally {
-      this.setLoading(false);
-    }
-  },
-  
+
   filterByCustomer(customer) {
     this.selectedCustomer = customer;
     this.loadPallets();
@@ -1531,193 +1819,376 @@ const app = {
     this.loadActivity();
     this.render();
   },
-  
-  setView(view) {
+setView(view) {
     this.view = view;
+
+    // Always close sidebar after navigation (mobile + desktop)
+    this.sidebarOpen = false;
+
+    // Leaving scanner states
     this.scanMode = null;
-    this.stopScanner();
+    this.stopScanner?.();
+
     this.render();
+
     if (view === 'dashboard') {
-      setTimeout(() => this.initCharts(), 100);
+      setTimeout(() => this.initCharts?.(), 100);
     }
   },
-  
+
+
   search(term) {
     this.searchTerm = term.toLowerCase();
     this.render();
   },
-  
   render() {
-    const app = document.getElementById('app');
-    
+    const appEl = document.getElementById('app');
+    if (!appEl) return;
+
+    // Scanner is full-screen modal content
     if (this.scanMode) {
-      app.innerHTML = this.renderScanner();
+      appEl.innerHTML = this.renderScanner();
+      this._postRender();
       return;
     }
-    
-    app.innerHTML = `
-      <div class="min-h-screen">
-        ${this.renderNav()}
-        <div class="container mx-auto px-4 py-6">
-          ${this.view === 'scan' ? this.renderScan() :
-            this.view === 'tracker' ? this.renderTracker() :
-            this.view === 'history' ? this.renderHistory() :
-            this.view === 'dashboard' ? this.renderDashboard() :
-            this.view === 'settings' ? this.renderSettings() :
-            this.view === 'location-qrs' ? this.renderLocationQRs() :
-            this.view === 'single-qr' ? this.renderSingleQR() :
-            ''}
-        </div>
-      </div>
-    `;
-    
+
+    // View content
+    const content =
+      this.view === 'scan' ? this.renderScan() :
+      this.view === 'tracker' ? this.renderTracker() :
+      this.view === 'history' ? this.renderHistory() :
+      this.view === 'dashboard' ? this.renderDashboard() :
+      this.view === 'settings' ? this.renderSettings() :
+      this.view === 'location-qrs' ? this.renderLocationQRs() :
+      this.view === 'single-qr' ? this.renderSingleQR() :
+      '';
+
+    appEl.innerHTML = this.renderShell(content);
+    this._postRender();
+  },
+
+  _postRender() {
+    // Highlight active nav
+    this._setActiveNav();
+
+    // Tracker bindings
     if (this.view === 'tracker') {
       const searchInput = document.getElementById('search-input');
-      if (searchInput) {
+      if (searchInput && !searchInput.__wtBound) {
+        searchInput.__wtBound = true;
         searchInput.addEventListener('input', (e) => this.search(e.target.value));
       }
-      
+
       const customerFilter = document.getElementById('customer-filter');
-      if (customerFilter) {
-        customerFilter.value = this.selectedCustomer;
-      }
+      if (customerFilter) customerFilter.value = this.selectedCustomer || '';
     }
-    
+
+    // History bindings
     if (this.view === 'history') {
       const customerFilter = document.getElementById('history-customer-filter');
-      if (customerFilter) {
-        customerFilter.value = this.selectedCustomer;
-      }
+      if (customerFilter) customerFilter.value = this.selectedCustomer || '';
     }
   },
-  
-  renderNav() {
-    return `
-      <nav class="bg-gradient-to-r from-blue-600 to-blue-700 text-white shadow-lg print:hidden">
-        <div class="container mx-auto px-4 py-4">
-          <div class="flex justify-between items-center">
-            <h1 class="text-3xl font-bold flex items-center gap-3">
-              <span class="text-4xl">📦</span> Warehouse Tracker
-            </h1>
-            <div class="flex gap-2 flex-wrap">
-              <button 
-                onclick="app.setView('scan')" 
-                class="px-4 py-2 rounded-lg font-semibold ${this.view === 'scan' ? 'bg-white text-blue-600' : 'bg-blue-500 hover:bg-blue-400'}"
-              >
-                📷 Scan
-              </button>
-              <button 
-                onclick="app.setView('tracker')" 
-                class="px-4 py-2 rounded-lg font-semibold ${this.view === 'tracker' ? 'bg-white text-blue-600' : 'bg-blue-500 hover:bg-blue-400'}"
-              >
-                📋 Tracker
-              </button>
-              <button 
-                onclick="app.setView('history')" 
-                class="px-4 py-2 rounded-lg font-semibold ${this.view === 'history' ? 'bg-white text-blue-600' : 'bg-blue-500 hover:bg-blue-400'}"
-              >
-                📜 History
-              </button>
-              <button 
-                onclick="app.setView('dashboard')" 
-                class="px-4 py-2 rounded-lg font-semibold ${this.view === 'dashboard' ? 'bg-white text-blue-600' : 'bg-blue-500 hover:bg-blue-400'}"
-              >
-                📊 Dashboard
-              </button>
-              <button 
-                onclick="app.setView('settings')" 
-                class="px-4 py-2 rounded-lg font-semibold ${this.view === 'settings' ? 'bg-white text-blue-600' : 'bg-blue-500 hover:bg-blue-400'}"
-              >
-                ⚙️ Settings
-              </button>
-            </div>
-          </div>
-        </div>
-      </nav>
-    `;
+
+  updateConnectionUI(state, text) {
+    const dot1 = document.getElementById('wt-dot-inline');
+    const dot2 = document.getElementById('wt-dot');
+    const t1 = document.getElementById('wt-conn-text');
+    const t2 = document.getElementById('wt-status-text');
+
+    [dot1, dot2].forEach((d) => {
+      if (!d) return;
+      d.classList.remove('is-ok', 'is-warn', 'is-bad');
+      d.classList.add(state);
+    });
+
+    if (t1) t1.textContent = text;
+    if (t2) t2.textContent = text;
   },
-  
-  renderScan() {
+
+  wtToggleSidebar() {
+    this.sidebarOpen = !this.sidebarOpen;
+    this.render();
+  },
+
+  wtCloseSidebar() {
+    if (!this.sidebarOpen) return;
+    this.sidebarOpen = false;
+    this.render();
+  },
+
+  _setActiveNav() {
+    const ids = ['scan', 'tracker', 'history', 'dashboard', 'settings'];
+    ids.forEach((v) => {
+      const el = document.getElementById(`wt-nav-${v}`);
+      if (!el) return;
+      const active = this.view === v;
+      el.classList.toggle('is-active', active);
+      if (active) el.setAttribute('aria-current', 'page');
+      else el.removeAttribute('aria-current');
+    });
+  },
+
+  renderShell(contentHtml) {
+    const sidebarOpen = !!this.sidebarOpen;
+
+    const navBtn = (id, label) => {
+      const active = this.view === id ? ' is-active' : '';
+      const current = this.view === id ? ' aria-current="page"' : '';
+      return `<button id="wt-nav-${id}" class="wt-nav-btn${active}" onclick="app.setView('${id}')"${current}>${label}</button>`;
+    };
+
     return `
-      <div class="max-w-4xl mx-auto space-y-6 fade-in">
-        <div class="text-center mb-8">
-          <h2 class="text-4xl font-bold text-gray-900 mb-2">Quick Actions</h2>
-          <p class="text-gray-600">Scan QR codes or enter information manually</p>
-        </div>
-        
-        <!-- Main Actions Section -->
-        <div class="bg-white p-6 rounded-2xl shadow-xl border-2 border-gray-200">
-          <h3 class="text-xl font-bold text-gray-800 mb-4 flex items-center gap-2">
-            <span class="text-2xl">📦</span> Pallet Operations
-          </h3>
-          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div class="bg-gradient-to-br from-green-500 to-green-600 text-white p-6 rounded-xl shadow-lg card-hover cursor-pointer" onclick="app.startScanner('checkin-pallet')">
-              <div class="flex flex-col items-center text-center">
-                <div class="text-6xl mb-3">📥</div>
-                <h3 class="text-xl font-bold mb-1">Check In Pallet</h3>
-                <p class="text-green-100 text-sm">Scan pallet QR code and location</p>
+      <div id="wtShell" class="wt-shell ${sidebarOpen ? 'sidebar-open' : ''}">
+        <div class="wt-topbar">
+          <button class="wt-icon-btn wt-menu-btn" aria-label="Open menu" onclick="app.wtToggleSidebar()">☰</button>
+
+          <div class="wt-topbar-left">
+            <div class="wt-brand">
+              <span class="wt-brand-emoji">📦</span>
+              <div class="wt-brand-text">
+                <div class="wt-brand-title">Warehouse Tracker</div>
+                <div class="wt-brand-sub">Live inventory • PWA</div>
               </div>
             </div>
-            
-            <div class="bg-gradient-to-br from-red-500 to-red-600 text-white p-6 rounded-xl shadow-lg card-hover cursor-pointer" onclick="app.startScanner('checkout')">
-              <div class="flex flex-col items-center text-center">
-                <div class="text-6xl mb-3">📤</div>
-                <h3 class="text-xl font-bold mb-1">Check Out Pallet</h3>
-                <p class="text-red-100 text-sm">Remove entire pallet from inventory</p>
-              </div>
-            </div>
-            
-            <div class="bg-gradient-to-br from-orange-500 to-orange-600 text-white p-6 rounded-xl shadow-lg card-hover cursor-pointer" onclick="app.startScanner('checkout-units')">
-              <div class="flex flex-col items-center text-center">
-                <div class="text-6xl mb-3">📊</div>
-                <h3 class="text-xl font-bold mb-1">Check Out Units</h3>
-                <p class="text-orange-100 text-sm">Remove partial units from pallet</p>
-              </div>
-            </div>
-            
-            <div class="bg-gradient-to-br from-blue-500 to-blue-600 text-white p-6 rounded-xl shadow-lg card-hover cursor-pointer" onclick="app.showManualEntry()">
-              <div class="flex flex-col items-center text-center">
-                <div class="text-6xl mb-3">✍️</div>
-                <h3 class="text-xl font-bold mb-1">Manual Entry</h3>
-                <p class="text-blue-100 text-sm">Enter pallet information manually</p>
-              </div>
+
+            <span class="wt-pill wt-pill-gray" id="wt-conn-pill">
+              <span id="wt-dot-inline" class="wt-dot is-warn"></span>
+              <span id="wt-conn-text">Connecting…</span>
+            </span>
+          </div>
+
+          <div class="wt-topbar-right">
+            <div class="wt-updated">
+              <div class="wt-updated-label">Last updated</div>
+              <div class="wt-updated-value" id="wt-last-updated">—</div>
             </div>
           </div>
         </div>
-        
-        <!-- QR Code Generation Section -->
-        <div class="bg-white p-6 rounded-2xl shadow-xl border-2 border-gray-200">
-          <h3 class="text-xl font-bold text-gray-800 mb-4 flex items-center gap-2">
-            <span class="text-2xl">🔳</span> QR Code Generation
-          </h3>
-          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <button 
-              onclick="app.generatePalletQR()" 
-              class="bg-gradient-to-r from-purple-500 to-purple-600 text-white p-6 rounded-xl shadow-lg hover:from-purple-600 hover:to-purple-700 font-bold text-lg flex items-center justify-center gap-3"
-            >
-              <span class="text-4xl">📱</span>
-              <div class="text-left">
-                <div class="text-lg font-bold">Generate Pallet QR</div>
-                <div class="text-sm text-purple-100 font-normal">Create QR code for new pallet</div>
+
+        <div class="wt-body">
+          <aside class="wt-sidebar" aria-label="Navigation">
+            <div class="wt-sidebar-inner">
+              <div class="wt-sidebar-title">Warehouse Tracker</div>
+              <div class="wt-sidebar-sub">Live inventory</div>
+
+              <div class="wt-sidebar-nav">
+                ${navBtn('scan', '📷 Scan')}
+                ${navBtn('tracker', '📋 Tracker')}
+                ${navBtn('history', '📜 History')}
+                ${navBtn('dashboard', '📊 Dashboard')}
+                ${navBtn('settings', '⚙️ Settings')}
               </div>
-            </button>
-            
-            <button 
-              onclick="app.generateLocationQRs()" 
-              class="bg-gradient-to-r from-indigo-500 to-indigo-600 text-white p-6 rounded-xl shadow-lg hover:from-indigo-600 hover:to-indigo-700 font-bold text-lg flex items-center justify-center gap-3"
-            >
-              <span class="text-4xl">🏢</span>
-              <div class="text-left">
-                <div class="text-lg font-bold">Location QR Codes</div>
-                <div class="text-sm text-indigo-100 font-normal">Generate all location codes</div>
+
+              <div class="wt-sidebar-sep"></div>
+
+              <div class="wt-sidebar-meta">
+                <div class="wt-meta-row">
+                  <span class="wt-meta-label">Server</span>
+                  <span class="wt-meta-value" id="wt-server-origin">${window.location.origin}</span>
+                </div>
+                <div class="wt-meta-row">
+                  <span class="wt-meta-label">Sync</span>
+                  <span class="wt-meta-value" id="wt-status-text">Connecting…</span>
+                </div>
               </div>
-            </button>
-          </div>
+
+              <div class="wt-sidebar-footer">
+                <div class="wt-pill wt-pill-gray">
+                  <span id="wt-dot" class="wt-dot is-warn"></span>
+                  <span id="wt-foot-text">Connecting…</span>
+                </div>
+              </div>
+            </div>
+          </aside>
+
+          <main class="wt-main">
+            <div class="wt-main-inner">
+              ${contentHtml}
+            </div>
+          </main>
         </div>
+
+        <button class="wt-backdrop" aria-label="Close menu" onclick="app.wtCloseSidebar()"></button>
       </div>
     `;
   },
+
   
+  renderScan() {
+  return `
+    <div class="fade-in">
+      <div class="mx-auto max-w-5xl space-y-6">
+
+        <!-- Header -->
+        <div class="flex items-end justify-between gap-4 flex-wrap">
+          <div>
+            <div class="text-sm font-semibold text-slate-600">Scan</div>
+            <h2 class="mt-1 text-3xl font-extrabold tracking-tight text-slate-900">
+              Quick actions
+            </h2>
+            <p class="mt-2 text-slate-600">
+              Check in, check out, remove units, or enter manually.
+            </p>
+          </div>
+
+          <div class="flex items-center gap-2">
+            <span class="inline-flex items-center rounded-full bg-emerald-500/10 px-3 py-1 text-xs font-semibold text-emerald-700">
+              Recommended workflow: Scan → Confirm details
+            </span>
+          </div>
+        </div>
+
+        <!-- Primary actions -->
+        <div class="rounded-2xl border border-slate-200 bg-white/80 shadow-sm backdrop-blur">
+          <div class="border-b border-slate-200 px-6 py-4">
+            <div class="text-sm font-semibold text-slate-800">Pallet operations</div>
+            <div class="text-sm text-slate-500">Use the camera or manual entry.</div>
+          </div>
+
+          <div class="grid grid-cols-1 gap-4 p-6 sm:grid-cols-2">
+            <!-- Check in -->
+            <button
+              type="button"
+              onclick="app.startScanner('checkin-pallet')"
+              class="group w-full rounded-2xl border border-slate-200 bg-white p-5 text-left shadow-sm transition hover:-translate-y-[1px] hover:border-slate-300 hover:shadow-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+            >
+              <div class="flex items-start gap-4">
+                <div class="flex h-11 w-11 items-center justify-center rounded-xl bg-emerald-500/10 text-emerald-700">
+                  <span class="text-base font-black">IN</span>
+                </div>
+                <div class="min-w-0">
+                  <div class="flex items-center gap-2">
+                    <div class="text-base font-bold text-slate-900">Check in</div>
+                    <span class="rounded-full bg-emerald-500/10 px-2 py-0.5 text-[11px] font-semibold text-emerald-700">
+                      scan
+                    </span>
+                  </div>
+                  <div class="mt-1 text-sm text-slate-600">
+                    Scan pallet QR, then scan a location.
+                  </div>
+                  <div class="mt-3 text-xs font-semibold text-slate-500 group-hover:text-slate-700">
+                    Opens the details prompt after scanning →
+                  </div>
+                </div>
+              </div>
+            </button>
+
+            <!-- Check out -->
+            <button
+              type="button"
+              onclick="app.startScanner('checkout')"
+              class="group w-full rounded-2xl border border-slate-200 bg-white p-5 text-left shadow-sm transition hover:-translate-y-[1px] hover:border-slate-300 hover:shadow-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+            >
+              <div class="flex items-start gap-4">
+                <div class="flex h-11 w-11 items-center justify-center rounded-xl bg-rose-500/10 text-rose-700">
+                  <span class="text-base font-black">OUT</span>
+                </div>
+                <div class="min-w-0">
+                  <div class="flex items-center gap-2">
+                    <div class="text-base font-bold text-slate-900">Check out</div>
+                    <span class="rounded-full bg-rose-500/10 px-2 py-0.5 text-[11px] font-semibold text-rose-700">
+                      remove
+                    </span>
+                  </div>
+                  <div class="mt-1 text-sm text-slate-600">
+                    Remove an entire pallet entry from inventory.
+                  </div>
+                  <div class="mt-3 text-xs font-semibold text-slate-500 group-hover:text-slate-700">
+                    Requires pallet QR →
+                  </div>
+                </div>
+              </div>
+            </button>
+
+            <!-- Remove units -->
+            <button
+              type="button"
+              onclick="app.startScanner('checkout-units')"
+              class="group w-full rounded-2xl border border-slate-200 bg-white p-5 text-left shadow-sm transition hover:-translate-y-[1px] hover:border-slate-300 hover:shadow-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+            >
+              <div class="flex items-start gap-4">
+                <div class="flex h-11 w-11 items-center justify-center rounded-xl bg-amber-500/10 text-amber-800">
+                  <span class="text-lg font-black">−</span>
+                </div>
+                <div class="min-w-0">
+                  <div class="flex items-center gap-2">
+                    <div class="text-base font-bold text-slate-900">Remove units</div>
+                    <span class="rounded-full bg-amber-500/10 px-2 py-0.5 text-[11px] font-semibold text-amber-800">
+                      partial
+                    </span>
+                  </div>
+                  <div class="mt-1 text-sm text-slate-600">
+                    Scan a pallet and remove some units.
+                  </div>
+                  <div class="mt-3 text-xs font-semibold text-slate-500 group-hover:text-slate-700">
+                    For unit-tracked pallets →
+                  </div>
+                </div>
+              </div>
+            </button>
+
+            <!-- Manual entry -->
+            <button
+              type="button"
+              onclick="app.showManualEntry()"
+              class="group w-full rounded-2xl border border-slate-200 bg-white p-5 text-left shadow-sm transition hover:-translate-y-[1px] hover:border-slate-300 hover:shadow-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+            >
+              <div class="flex items-start gap-4">
+                <div class="flex h-11 w-11 items-center justify-center rounded-xl bg-blue-500/10 text-blue-700">
+                  <span class="text-lg font-black">✎</span>
+                </div>
+                <div class="min-w-0">
+                  <div class="text-base font-bold text-slate-900">Manual entry</div>
+                  <div class="mt-1 text-sm text-slate-600">
+                    Enter customer, product, quantities, and location.
+                  </div>
+                  <div class="mt-3 text-xs font-semibold text-slate-500 group-hover:text-slate-700">
+                    We’ll add “Parts list” here next →
+                  </div>
+                </div>
+              </div>
+            </button>
+          </div>
+        </div>
+
+        <!-- QR tools (secondary) -->
+        <div class="rounded-2xl border border-slate-200 bg-white/80 shadow-sm backdrop-blur">
+          <div class="border-b border-slate-200 px-6 py-4">
+            <div class="text-sm font-semibold text-slate-800">QR tools</div>
+            <div class="text-sm text-slate-500">Generate printable labels.</div>
+          </div>
+
+          <div class="flex flex-wrap items-center justify-between gap-3 px-6 py-5">
+            <div class="text-sm text-slate-600">
+              Use these when you need new pallet labels or full location label sets.
+            </div>
+
+            <div class="flex flex-wrap gap-3">
+              <button
+                type="button"
+                onclick="app.generatePalletQR()"
+                class="rounded-xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white shadow-sm hover:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              >
+                Generate pallet QR
+              </button>
+
+              <button
+                type="button"
+                onclick="app.generateLocationQRs()"
+                class="rounded-xl border border-slate-300 bg-white px-4 py-3 text-sm font-semibold text-slate-900 shadow-sm hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              >
+                Location QR codes
+              </button>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  `;
+},
+
   renderScanner() {
     const message = this.scanMode === 'checkin-pallet' ? 'Scan Pallet QR Code' :
                    this.scanMode === 'checkin-location' ? 'Scan Location QR Code' :
@@ -2029,7 +2500,8 @@ const app = {
                     value="${this.googleSheetsUrl}"
                     placeholder="https://script.google.com/macros/s/..."
                     class="w-full border-2 border-gray-300 p-3 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 font-mono"
-                    onchange="app.saveGoogleSheetsUrl(this.value)"
+                    oninput="app.saveGoogleSheetsUrl(this.value)"
+                    onblur="app.saveGoogleSheetsUrl(this.value)"
                   />
                   <p class="text-xs text-gray-500 mt-2">
                     Paste the Web App URL from your Google Apps Script deployment
@@ -2047,8 +2519,14 @@ const app = {
                     onclick="app.syncAllToGoogleSheets()" 
                     class="bg-blue-600 text-white px-4 py-2 rounded-lg font-semibold hover:bg-blue-700 text-sm flex items-center gap-2"
                   >
-                    <span>🔄</span> Sync All Inventory Now
+                    <span>🔄</span> Smart Sync (Add Missing Items)
                   </button>
+                </div>
+                
+                <div class="bg-blue-50 border border-blue-200 p-3 rounded-lg text-sm text-blue-800">
+                  <p class="font-semibold mb-1">ℹ️ About Smart Sync</p>
+                  <p>Adds any missing pallets to Google Sheets and updates quantities. <strong>Removal history is preserved.</strong></p>
+                  <p class="mt-1 text-xs">Use this if you notice pallets missing from sheets or quantities are out of sync.</p>
                 </div>
                 
                 ${this.googleSheetsUrl ? `
@@ -2085,129 +2563,119 @@ const app = {
   
   renderTracker() {
     let pallets = this.pallets;
-    
+
     if (this.searchTerm) {
-      pallets = pallets.filter(p => 
-        p.product_id.toLowerCase().includes(this.searchTerm) ||
-        p.location.toLowerCase().includes(this.searchTerm) ||
-        p.customer_name.toLowerCase().includes(this.searchTerm)
+      pallets = pallets.filter(p =>
+        (p.product_id || '').toLowerCase().includes(this.searchTerm) ||
+        (p.location || '').toLowerCase().includes(this.searchTerm) ||
+        (p.customer_name || '').toLowerCase().includes(this.searchTerm)
       );
     }
-    
+
+    const rows = pallets.map(p => {
+      const palletsQty = Number(p.pallet_quantity) || 0;
+      const unitsPerPallet = Number(p.product_quantity) || 0;
+      const totalUnits = unitsPerPallet > 0 ? (p.current_units ?? (palletsQty * unitsPerPallet)) : '';
+      const added = p.date_added ? new Date(p.date_added).toLocaleDateString() : '';
+      const partsCount = Array.isArray(p.parts) ? p.parts.length : 0;
+
+      return `
+        <tr class="wt-row">
+          <td class="wt-cell wt-strong">
+            ${p.product_id || ''}
+            ${partsCount ? `<span class="wt-pill wt-pill-gray" title="Parts list attached">📋 ${partsCount}</span>` : ''}
+          </td>
+          <td class="wt-cell wt-link">${p.customer_name || ''}</td>
+          <td class="wt-cell">${p.location || ''}</td>
+          <td class="wt-cell wt-num">${palletsQty}</td>
+          <td class="wt-cell wt-num">${unitsPerPallet || ''}</td>
+          <td class="wt-cell wt-num">${totalUnits}</td>
+          <td class="wt-cell">${added}</td>
+          <td class="wt-cell wt-actions">
+            <button onclick="app.reprintPalletQR('${p.id}')" class="wt-btn wt-btn-purple">🖨️ Reprint</button>
+            ${unitsPerPallet > 0 ? `<button onclick="app.removePartialUnits('${p.id}')" class="wt-btn wt-btn-yellow">📦 Remove Units</button>` : ''}
+            <button onclick="app.showProductInfo('${p.id}')" class="wt-btn wt-btn-blue">ℹ️ Info</button>
+          </td>
+        </tr>
+      `;
+    }).join('');
+
     return `
       <div class="space-y-6 fade-in">
         <div>
           <h2 class="text-3xl font-bold text-gray-900 mb-2">📋 Inventory Tracker</h2>
-          <p class="text-gray-600">View and manage all pallets in the warehouse</p>
+          <p class="text-gray-600">Table view of all pallets</p>
         </div>
-        
-        <div class="space-y-4">
-          <div class="flex gap-3 flex-wrap">
-            ${this.customers.length > 0 ? `
-              <select 
-                id="customer-filter"
-                class="border-2 border-gray-300 p-3 rounded-xl text-base bg-white font-semibold focus:ring-2 focus:ring-blue-500 focus:border-blue-500 shadow-sm"
-                onchange="app.filterByCustomer(this.value)"
-              >
-                <option value="">All Customers</option>
-                ${this.customers.map(customer => `
-                  <option value="${customer}" ${this.selectedCustomer === customer ? 'selected' : ''}>
-                    ${customer}
-                  </option>
-                `).join('')}
-              </select>
-            ` : ''}
-            
-            <input 
-              id="search-input"
-              type="text" 
-              placeholder="🔍 Search product or location..." 
-              value="${this.searchTerm}"
-              class="flex-1 border-2 border-gray-300 p-3 rounded-xl text-base focus:ring-2 focus:ring-blue-500 focus:border-blue-500 shadow-sm"
-            />
-            
-            <a href="${API_URL}/api/export${this.selectedCustomer ? '?customer=' + encodeURIComponent(this.selectedCustomer) : ''}" download class="bg-blue-600 text-white px-6 py-3 rounded-xl flex items-center whitespace-nowrap font-semibold hover:bg-blue-700 shadow-lg">
-              ⬇ Export CSV
-            </a>
-          </div>
-          
-          ${this.selectedCustomer ? `
-            <div class="bg-blue-50 border-l-4 border-blue-500 px-5 py-3 rounded-r-xl shadow-sm">
-              <p class="text-sm text-blue-800">
-                <strong class="font-bold">${pallets.length} pallet(s)</strong> for <strong class="font-bold">${this.selectedCustomer}</strong>
-              </p>
-            </div>
+
+        <div class="flex gap-3 flex-wrap items-center">
+          ${this.customers.length > 0 ? `
+            <select
+              id="customer-filter"
+              class="border-2 border-gray-300 p-3 rounded-xl text-base bg-white font-semibold focus:ring-2 focus:ring-blue-500 focus:border-blue-500 shadow-sm"
+              onchange="app.filterByCustomer(this.value)"
+            >
+              <option value="">All Customers</option>
+              ${this.customers.map(customer => `
+                <option value="${customer}" ${this.selectedCustomer === customer ? 'selected' : ''}>
+                  ${customer}
+                </option>
+              `).join('')}
+            </select>
           ` : ''}
+
+          <input
+            id="search-input"
+            type="text"
+            placeholder="🔍 Search product, location, customer..."
+            value="${this.searchTerm}"
+            class="flex-1 min-w-[260px] border-2 border-gray-300 p-3 rounded-xl text-base focus:ring-2 focus:ring-blue-500 focus:border-blue-500 shadow-sm"
+          />
+
+          <a href="${API_URL}/api/export${this.selectedCustomer ? '?customer=' + encodeURIComponent(this.selectedCustomer) : ''}" download
+            class="bg-blue-600 text-white px-6 py-3 rounded-xl flex items-center whitespace-nowrap font-semibold hover:bg-blue-700 shadow-lg">
+            ⬇ Export CSV
+          </a>
         </div>
-        
-        <div class="space-y-3 inventory-results">
-          ${pallets.length === 0 ? 
-            `<div class="text-center text-gray-500 py-16">
-              <div class="text-6xl mb-4">📦</div>
-              <div class="text-xl font-semibold mb-2">No pallets found</div>
-              <p class="text-gray-400">${this.selectedCustomer ? `No inventory for ${this.selectedCustomer}` : 'Start by checking in a pallet'}</p>
-            </div>` :
-            pallets.map(p => `
-              <div class="bg-white p-5 rounded-xl shadow-sm card-hover flex justify-between items-start border border-gray-100">
-                <div class="flex-1">
-                  <h3 class="font-bold text-xl text-gray-900">${p.product_id}</h3>
-                  <p class="text-blue-600 font-semibold text-sm mt-2 flex items-center gap-2">
-                    <span class="text-lg">👤</span> ${p.customer_name}
-                  </p>
-                  <p class="text-gray-600 text-sm mt-2 flex items-center gap-2">
-                    <span class="text-lg">📍</span> ${p.location}
-                  </p>
-                  <div class="text-sm mt-3 flex items-center gap-3 flex-wrap">
-                    <span class="bg-gradient-to-r from-green-100 to-green-50 text-green-700 px-3 py-1 rounded-full font-bold">
-                      🎫 ${p.pallet_quantity} pallet${p.pallet_quantity > 1 ? 's' : ''}
-                    </span>
-                    ${p.product_quantity > 0 ? `
-                      <span class="bg-gradient-to-r from-purple-100 to-purple-50 text-purple-700 px-3 py-1 rounded-full font-bold">
-                        📦 ${p.product_quantity} units/pallet
-                      </span>
-                      <span class="bg-gradient-to-r from-blue-100 to-blue-50 text-blue-700 px-3 py-1 rounded-full font-bold">
-                        = ${p.current_units || (p.pallet_quantity * p.product_quantity)} total units
-                      </span>
-                    ` : ''}
-                    <span class="text-xs text-gray-500">Added ${new Date(p.date_added).toLocaleDateString()}</span>
+
+        ${this.selectedCustomer ? `
+          <div class="bg-blue-50 border-l-4 border-blue-500 px-5 py-3 rounded-r-xl shadow-sm">
+            <p class="text-sm text-blue-800">
+              <strong class="font-bold">${pallets.length} pallet(s)</strong> for <strong class="font-bold">${this.selectedCustomer}</strong>
+            </p>
+          </div>
+        ` : ''}
+
+        <div class="wt-table-wrap">
+          <table class="wt-table">
+            <thead>
+              <tr>
+                <th>Product</th>
+                <th>Customer</th>
+                <th>Location</th>
+                <th class="wt-th-num">Pallets</th>
+                <th class="wt-th-num">Units/Pallet</th>
+                <th class="wt-th-num">Total Units</th>
+                <th>Added</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${rows || `
+                <tr><td class="wt-cell" colspan="8">
+                  <div class="text-center text-gray-500 py-10">
+                    <div class="text-5xl mb-3">📦</div>
+                    <div class="text-lg font-semibold">No pallets found</div>
+                    <p class="text-gray-400">${this.selectedCustomer ? `No inventory for ${this.selectedCustomer}` : 'Start by checking in a pallet'}</p>
                   </div>
-                  ${p.parts && p.parts.length > 0 ? `
-                    <div class="mt-3 p-3 bg-gray-50 rounded-lg">
-                      <p class="text-xs font-semibold text-gray-700 mb-2">📋 Parts List:</p>
-                      <div class="space-y-1">
-                        ${p.parts.map(part => `
-                          <div class="text-xs text-gray-600 flex justify-between">
-                            <span>${part.part_number}</span>
-                            <span class="font-semibold">×${part.quantity}</span>
-                          </div>
-                        `).join('')}
-                      </div>
-                    </div>
-                  ` : ''}
-                </div>
-                <div class="flex flex-col gap-2 ml-4">
-                  <button onclick="app.reprintPalletQR('${p.id}')" class="bg-purple-500 text-white px-4 py-2 rounded-xl text-sm font-bold hover:bg-purple-600 shadow-md whitespace-nowrap">
-                    🖨️ Reprint QR
-                  </button>
-                  <button onclick="app.removePartialQuantity('${p.id}')" class="bg-orange-500 text-white px-4 py-2 rounded-xl text-sm font-bold hover:bg-orange-600 shadow-md whitespace-nowrap">
-                    Remove Pallets
-                  </button>
-                  ${p.product_quantity > 0 ? `
-                    <button onclick="app.removePartialUnits('${p.id}')" class="bg-yellow-500 text-white px-4 py-2 rounded-xl text-sm font-bold hover:bg-yellow-600 shadow-md whitespace-nowrap">
-                      Remove Units
-                    </button>
-                  ` : ''}
-                  <button onclick="app.showProductInfo('${p.id}')" class="bg-blue-500 text-white px-4 py-2 rounded-xl text-sm font-bold hover:bg-blue-600 shadow-md whitespace-nowrap">
-                    Product Info
-                  </button>
-                </div>
-              </div>
-            `).join('')
-          }
+                </td></tr>
+              `}
+            </tbody>
+          </table>
         </div>
       </div>
     `;
   },
+
   
   renderHistory() {
     const getActionBadge = (action) => {
@@ -2318,5 +2786,34 @@ const app = {
     `;
   }
 };
+// Make sure inline onclick="app.xxx()" works
+window.app = app;
 
+// Boot once DOM is ready
+document.addEventListener("DOMContentLoaded", () => {
+  try {
+    if (typeof app.init === "function") app.init();
+    else if (typeof app.render === "function") app.render();
+  } catch (e) {
+    console.error("App boot error:", e);
+  }
+});
+
+// Initialize app
 app.init();
+
+// Cleanup on page unload
+window.addEventListener('beforeunload', () => {
+  app.stopAutoRefresh();
+});
+
+// Also cleanup on page hide (mobile browsers)
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    console.log('Page hidden - pausing auto-refresh');
+  } else {
+    console.log('Page visible - resuming auto-refresh');
+    app.startAutoRefresh();
+  }
+});
+})();

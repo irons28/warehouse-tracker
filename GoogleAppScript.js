@@ -1,624 +1,758 @@
 /**
  * Warehouse Tracker - Google Sheets Integration
- * 
- * This script creates separate tabs for each customer and tracks both
- * check-ins and removals (check-outs, partial removals, unit removals)
- * 
- * SETUP INSTRUCTIONS:
- * 1. Open your Google Sheet
- * 2. Go to Extensions > Apps Script
- * 3. Delete any existing code
- * 4. Paste this entire script
- * 5. Click Save (disk icon)
- * 6. Click Deploy > New Deployment
- * 7. Click gear icon > Select "Web app"
- * 8. Set "Execute as" to "Me"
- * 9. Set "Who has access" to "Anyone"
- * 10. Click Deploy
- * 11. Copy the Web App URL and paste it in Warehouse Tracker Settings
+ *
+ * Paste this entire script into Apps Script as Code.gs (replace all),
+ * then Deploy as Web App:
+ * - Execute as: Me
+ * - Who has access: Anyone
+ *
+ * This script:
+ * - Keeps your existing per-customer tabs (so nothing breaks)
+ * - Maintains Activity Log + Removals History
+ * - ✅ Adds Daily_Storage (date + customer + pallets in storage) with UPSERT (no duplicates)
  */
 
-// Main function - handles all requests from the warehouse tracker
+const ACTIVITY_SHEET_NAME = "Activity Log";
+const REMOVALS_SHEET_NAME = "Removals History";
+const DAILY_STORAGE_SHEET_NAME = "Daily_Storage";
+
+function doGet() {
+  return createResponse({ success: true, message: "Warehouse Sheets Web App running" });
+}
+
 function doPost(e) {
   try {
-    const data = JSON.parse(e.postData.contents);
-    const action = data.action;
-    const payload = data.data;
-    
-    Logger.log('Received action: ' + action);
-    Logger.log('Payload: ' + JSON.stringify(payload));
-    
-    switch(action) {
-      case 'test':
-        return createResponse({ success: true, message: 'Connection successful!' });
-        
-      case 'add_pallet':
+    if (!e || !e.postData || !e.postData.contents) {
+      return createResponse({ success: false, message: "Missing request body" });
+    }
+
+    const req = JSON.parse(e.postData.contents);
+    const action = req.action;
+    const payload = req.data || {};
+
+    Logger.log("Received action: " + action);
+    Logger.log("Payload: " + JSON.stringify(payload));
+
+    switch (action) {
+      case "test":
+        getOrCreateActivitySheet();
+        getOrCreateRemovalsSheet();
+        getOrCreateDailyStorageSheet();
+        return createResponse({ success: true, message: "Connection successful!" });
+
+      case "add_pallet":
         return handleAddPallet(payload);
-        
-      case 'remove_pallet':
+
+      case "remove_pallet":
         return handleRemovePallet(payload);
-        
-      case 'update_quantity':
+
+      case "update_quantity":
         return handleUpdateQuantity(payload);
-        
-      case 'partial_remove':
-        return handlePartialRemove(payload);
-        
-      case 'units_remove':
+
+      case "partial_remove":
+        return handleUpdateQuantity(payload);
+
+      case "units_remove":
         return handleUnitsRemove(payload);
-        
-      case 'sync_all':
+
+      case "sync_all":
         return handleSyncAll(payload);
-        
+
+      // ✅ OPTIONAL UPGRADE ACTION
+      case "daily_snapshot":
+        return handleDailySnapshot(payload);
+
       default:
-        return createResponse({ success: false, message: 'Unknown action: ' + action });
+        return createResponse({ success: false, message: "Unknown action: " + action });
     }
   } catch (error) {
-    Logger.log('Error: ' + error.toString());
-    return createResponse({ success: false, message: 'Error: ' + error.toString() });
+    Logger.log("Error: " + error.toString());
+    return createResponse({ success: false, message: "Error: " + error.toString() });
   }
 }
 
-// Helper function to create HTTP response
-function createResponse(data) {
-  return ContentService.createTextOutput(JSON.stringify(data))
+function createResponse(obj) {
+  return ContentService
+    .createTextOutput(JSON.stringify(obj))
     .setMimeType(ContentService.MimeType.JSON);
 }
 
-// Get or create a sheet for a specific customer
+function safeSheetName_(name) {
+  const cleaned = String(name || "Unknown")
+    .trim()
+    .replace(/[\\/?*[\]:]/g, "-")
+    .slice(0, 80);
+  return cleaned || "Unknown";
+}
+
+function ensureHeaders_(sheet, headers, style) {
+  const headerRange = sheet.getRange(1, 1, 1, headers.length);
+  const existing = headerRange.getValues()[0];
+  const isEmpty = existing.every(v => v === "" || v === null);
+
+  if (isEmpty) {
+    headerRange.setValues([headers]);
+
+    if (style && style.bg && style.fg) {
+      headerRange.setFontWeight("bold");
+      headerRange.setBackground(style.bg);
+      headerRange.setFontColor(style.fg);
+    }
+
+    sheet.setFrozenRows(1);
+  }
+}
+
+// ========================
+// Customer Sheet
+// ========================
 function getOrCreateCustomerSheet(customerName) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  let sheet = ss.getSheetByName(customerName);
-  
-  if (!sheet) {
-    // Create new sheet for this customer
-    sheet = ss.insertSheet(customerName);
-    
-    // Set up headers with styling - NOW WITH REMOVAL TRACKING AND PERSONNEL
-    const headers = [
-      'Product ID', 
-      'Location', 
-      'Pallets', 
-      'Units/Pallet (Spec)', 
-      'Current Units',
-      'Parts List',
-      'Date Added',
-      'Scanned In By',
-      'Last Removal Date',
-      'Last Removal Qty',
-      'Last Removal By',
-      'Status'
-    ];
-    
-    const headerRange = sheet.getRange(1, 1, 1, headers.length);
-    headerRange.setValues([headers]);
-    headerRange.setFontWeight('bold');
-    headerRange.setBackground('#4285f4');
-    headerRange.setFontColor('#ffffff');
-    
-    // Set column widths
-    sheet.setColumnWidth(1, 150); // Product ID
-    sheet.setColumnWidth(2, 100); // Location
-    sheet.setColumnWidth(3, 80);  // Pallets
-    sheet.setColumnWidth(4, 130); // Units/Pallet (Spec)
-    sheet.setColumnWidth(5, 110); // Current Units
-    sheet.setColumnWidth(6, 200); // Parts List
-    sheet.setColumnWidth(7, 120); // Date Added
-    sheet.setColumnWidth(8, 120); // Scanned In By
-    sheet.setColumnWidth(9, 130); // Last Removal Date
-    sheet.setColumnWidth(10, 130); // Last Removal Qty
-    sheet.setColumnWidth(11, 120); // Last Removal By
-    sheet.setColumnWidth(12, 100); // Status
-    
-    // Freeze header row
-    sheet.setFrozenRows(1);
-  }
-  
+  const tabName = safeSheetName_(customerName);
+
+  let sheet = ss.getSheetByName(tabName);
+  if (!sheet) sheet = ss.insertSheet(tabName);
+
+  const headers = [
+    "Product ID",
+    "Location",
+    "Pallets",
+    "Units/Pallet (Spec)",
+    "Current Units",
+    "Parts List",
+    "Date Added",
+    "Scanned In By",
+    "Last Removal Date",
+    "Last Removal Qty",
+    "Last Removal By",
+    "Status"
+  ];
+
+  ensureHeaders_(sheet, headers, { bg: "#4285f4", fg: "#ffffff" });
+
+  sheet.setColumnWidth(1, 150);
+  sheet.setColumnWidth(2, 100);
+  sheet.setColumnWidth(3, 80);
+  sheet.setColumnWidth(4, 130);
+  sheet.setColumnWidth(5, 110);
+  sheet.setColumnWidth(6, 260);
+  sheet.setColumnWidth(7, 140);
+  sheet.setColumnWidth(8, 140);
+  sheet.setColumnWidth(9, 150);
+  sheet.setColumnWidth(10, 130);
+  sheet.setColumnWidth(11, 140);
+  sheet.setColumnWidth(12, 100);
+
   return sheet;
 }
 
-// Get or create the Activity Log sheet
+// ========================
+// Activity Log
+// ========================
 function getOrCreateActivitySheet() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  let sheet = ss.getSheetByName('Activity Log');
-  
-  if (!sheet) {
-    sheet = ss.insertSheet('Activity Log', 0); // Insert as first sheet
-    
-    const headers = [
-      'Timestamp',
-      'Customer',
-      'Product ID',
-      'Location',
-      'Action',
-      'Quantity Changed',
-      'Before',
-      'After',
-      'Notes'
-    ];
-    
-    const headerRange = sheet.getRange(1, 1, 1, headers.length);
-    headerRange.setValues([headers]);
-    headerRange.setFontWeight('bold');
-    headerRange.setBackground('#ea4335');
-    headerRange.setFontColor('#ffffff');
-    
-    // Set column widths
-    sheet.setColumnWidth(1, 150); // Timestamp
-    sheet.setColumnWidth(2, 120); // Customer
-    sheet.setColumnWidth(3, 150); // Product ID
-    sheet.setColumnWidth(4, 100); // Location
-    sheet.setColumnWidth(5, 120); // Action
-    sheet.setColumnWidth(6, 120); // Quantity Changed
-    sheet.setColumnWidth(7, 80);  // Before
-    sheet.setColumnWidth(8, 80);  // After
-    sheet.setColumnWidth(9, 250); // Notes
-    
-    sheet.setFrozenRows(1);
-  }
-  
+  let sheet = ss.getSheetByName(ACTIVITY_SHEET_NAME);
+
+  if (!sheet) sheet = ss.insertSheet(ACTIVITY_SHEET_NAME, 0);
+
+  const headers = [
+    "Timestamp",
+    "Customer",
+    "Product ID",
+    "Location",
+    "Action",
+    "Quantity Changed",
+    "Before",
+    "After",
+    "Notes",
+    "By"
+  ];
+
+  ensureHeaders_(sheet, headers, { bg: "#ea4335", fg: "#ffffff" });
+
+  sheet.setColumnWidth(1, 170);
+  sheet.setColumnWidth(2, 140);
+  sheet.setColumnWidth(3, 180);
+  sheet.setColumnWidth(4, 110);
+  sheet.setColumnWidth(5, 150);
+  sheet.setColumnWidth(6, 140);
+  sheet.setColumnWidth(7, 90);
+  sheet.setColumnWidth(8, 90);
+  sheet.setColumnWidth(9, 320);
+  sheet.setColumnWidth(10, 140);
+
   return sheet;
 }
 
-// Get or create the Removals sheet
+// ========================
+// Removals History
+// ========================
 function getOrCreateRemovalsSheet() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  let sheet = ss.getSheetByName('Removals History');
-  
-  if (!sheet) {
-    sheet = ss.insertSheet('Removals History', 1); // Insert as second sheet after Activity Log
-    
-    const headers = [
-      'Timestamp',
-      'Customer',
-      'Product ID',
-      'Location',
-      'Removal Type',
-      'Qty Removed',
-      'Qty Before',
-      'Qty After',
-      'Notes',
-      'Removed By'
-    ];
-    
-    const headerRange = sheet.getRange(1, 1, 1, headers.length);
-    headerRange.setValues([headers]);
-    headerRange.setFontWeight('bold');
-    headerRange.setBackground('#ff9800');
-    headerRange.setFontColor('#ffffff');
-    
-    // Set column widths
-    sheet.setColumnWidth(1, 150); // Timestamp
-    sheet.setColumnWidth(2, 120); // Customer
-    sheet.setColumnWidth(3, 150); // Product ID
-    sheet.setColumnWidth(4, 100); // Location
-    sheet.setColumnWidth(5, 120); // Removal Type
-    sheet.setColumnWidth(6, 100); // Qty Removed
-    sheet.setColumnWidth(7, 80);  // Qty Before
-    sheet.setColumnWidth(8, 80);  // Qty After
-    sheet.setColumnWidth(9, 250); // Notes
-    sheet.setColumnWidth(10, 100); // Removed By
-    
-    sheet.setFrozenRows(1);
-  }
-  
+  let sheet = ss.getSheetByName(REMOVALS_SHEET_NAME);
+
+  if (!sheet) sheet = ss.insertSheet(REMOVALS_SHEET_NAME, 1);
+
+  const headers = [
+    "Timestamp",
+    "Customer",
+    "Product ID",
+    "Location",
+    "Removal Type",
+    "Qty Removed",
+    "Qty Before",
+    "Qty After",
+    "Notes",
+    "Removed By"
+  ];
+
+  ensureHeaders_(sheet, headers, { bg: "#ff9800", fg: "#ffffff" });
+
+  sheet.setColumnWidth(1, 170);
+  sheet.setColumnWidth(2, 140);
+  sheet.setColumnWidth(3, 180);
+  sheet.setColumnWidth(4, 110);
+  sheet.setColumnWidth(5, 150);
+  sheet.setColumnWidth(6, 120);
+  sheet.setColumnWidth(7, 100);
+  sheet.setColumnWidth(8, 100);
+  sheet.setColumnWidth(9, 320);
+  sheet.setColumnWidth(10, 140);
+
   return sheet;
 }
 
-// Log activity to the Activity Log sheet
-function logActivity(customer, productId, location, action, quantityChanged, before, after, notes) {
-  const sheet = getOrCreateActivitySheet();
-  const timestamp = new Date();
-  
-  sheet.appendRow([
-    timestamp,
-    customer,
-    productId,
-    location,
-    action,
-    quantityChanged,
-    before,
-    after,
-    notes || ''
-  ]);
-  
-  // Sort by timestamp descending (newest first)
-  const lastRow = sheet.getLastRow();
-  if (lastRow > 2) {
-    const range = sheet.getRange(2, 1, lastRow - 1, 9);
-    range.sort({column: 1, ascending: false});
-  }
+// ========================
+// ✅ Daily Storage Snapshot (Invoice-ready)
+// ========================
+function getOrCreateDailyStorageSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(DAILY_STORAGE_SHEET_NAME);
+
+  if (!sheet) sheet = ss.insertSheet(DAILY_STORAGE_SHEET_NAME, 2);
+
+  const headers = ["Date", "Customer", "Pallets in Storage"];
+  ensureHeaders_(sheet, headers, { bg: "#0f9d58", fg: "#ffffff" });
+
+  sheet.setColumnWidth(1, 120);
+  sheet.setColumnWidth(2, 180);
+  sheet.setColumnWidth(3, 150);
+
+  return sheet;
 }
 
-// Log removal to the Removals History sheet
+function logActivity(customer, productId, location, action, quantityChanged, before, after, notes, by) {
+  const sheet = getOrCreateActivitySheet();
+  sheet.appendRow([
+    new Date(),
+    customer || "Unknown",
+    productId || "",
+    location || "",
+    action || "",
+    quantityChanged || "",
+    before || "",
+    after || "",
+    notes || "",
+    by || ""
+  ]);
+
+  sortSheetByTimestampDesc_(sheet, 10);
+}
+
 function logRemoval(customer, productId, location, removalType, qtyRemoved, qtyBefore, qtyAfter, notes, removedBy) {
   const sheet = getOrCreateRemovalsSheet();
-  const timestamp = new Date();
-  
   sheet.appendRow([
-    timestamp,
-    customer,
-    productId,
-    location,
-    removalType,
-    qtyRemoved,
-    qtyBefore,
-    qtyAfter,
-    notes || '',
-    removedBy || 'System'
+    new Date(),
+    customer || "Unknown",
+    productId || "",
+    location || "",
+    removalType || "",
+    qtyRemoved || "",
+    qtyBefore || "",
+    qtyAfter || "",
+    notes || "",
+    removedBy || ""
   ]);
-  
-  // Sort by timestamp descending (newest first)
-  const lastRow = sheet.getLastRow();
-  if (lastRow > 2) {
-    const range = sheet.getRange(2, 1, lastRow - 1, 10);
-    range.sort({column: 1, ascending: false});
-  }
+
+  sortSheetByTimestampDesc_(sheet, 10);
 }
 
-// Handle adding a new pallet
+function sortSheetByTimestampDesc_(sheet, colCount) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 2) return;
+  const range = sheet.getRange(2, 1, lastRow - 1, colCount);
+  range.sort({ column: 1, ascending: false });
+}
+
+function formatPartsList(parts) {
+  if (!parts || !parts.length) return "";
+  return parts.map(p => `${p.part_number} (x${p.quantity || 1})`).join(", ");
+}
+
+// ========================
+// Handlers
+// ========================
 function handleAddPallet(data) {
-  const sheet = getOrCreateCustomerSheet(data.customer_name);
-  const productId = data.product_id;
-  const location = data.location;
-  const palletQty = data.pallet_quantity || 1;
-  const productQty = data.product_quantity || 0;
-  const currentUnits = data.current_units || productQty; // Use provided or default to full
-  const parts = data.parts ? formatPartsList(data.parts) : '';
-  const dateAdded = new Date(data.date_added || new Date());
-  
-  // Check if this product/location already exists
-  const dataRange = sheet.getDataRange();
-  const values = dataRange.getValues();
+  const customerName = data.customer_name || "Unknown";
+  const sheet = getOrCreateCustomerSheet(customerName);
+
+  const productId = data.product_id || "";
+  const location = data.location || "";
+  const palletQty = Number(data.pallet_quantity || 1);
+  const productQty = Number(data.product_quantity || 0);
+
+  const currentUnits = (data.current_units !== undefined && data.current_units !== null)
+    ? Number(data.current_units)
+    : Number(productQty);
+
+  const parts = data.parts ? formatPartsList(data.parts) : "";
+  const dateAdded = data.date_added ? new Date(data.date_added) : new Date();
+  const scannedBy = data.scanned_by || "Unknown";
+
+  const values = sheet.getDataRange().getValues();
   let existingRow = -1;
-  
+
   for (let i = 1; i < values.length; i++) {
-    if (values[i][0] === productId && values[i][1] === location && values[i][11] === 'Active') {
+    const isMatch = values[i][0] === productId && values[i][1] === location;
+    const isActive = values[i][11] === "Active";
+    if (isMatch && isActive) {
       existingRow = i + 1;
       break;
     }
   }
-  
+
   if (existingRow > 0) {
-    // Update existing entry
-    const currentPallets = values[existingRow - 1][2];
-    const currentUnitsExisting = values[existingRow - 1][4];
+    const currentPallets = Number(values[existingRow - 1][2] || 0);
+    const currentUnitsExisting = Number(values[existingRow - 1][4] || 0);
+
     const newPallets = currentPallets + palletQty;
     const newCurrentUnits = currentUnitsExisting + currentUnits;
-    
+
     sheet.getRange(existingRow, 3).setValue(newPallets);
     sheet.getRange(existingRow, 5).setValue(newCurrentUnits);
-    
+
     logActivity(
-      data.customer_name,
+      customerName,
       productId,
       location,
-      'CHECK_IN (Added to existing)',
+      "CHECK_IN (Added to existing)",
       palletQty,
       currentPallets,
       newPallets,
-      `Added ${palletQty} pallets to existing entry`
+      `Added ${palletQty} pallets to existing entry`,
+      scannedBy
     );
-  } else {
-    // Add new row - with new columns for removal tracking and personnel
-    sheet.appendRow([
-      productId,
-      location,
-      palletQty,
-      productQty, // Units/Pallet (original spec)
-      currentUnits, // Current Units (starts at full)
-      parts,
-      dateAdded,
-      data.scanned_by || 'Unknown', // Scanned In By
-      '', // Last Removal Date (empty initially)
-      '', // Last Removal Qty (empty initially)
-      '', // Last Removal By (empty initially)
-      'Active'
-    ]);
-    
-    logActivity(
-      data.customer_name,
-      productId,
-      location,
-      'CHECK_IN (New)',
-      palletQty,
-      0,
-      palletQty,
-      parts ? 'Includes parts list' : ''
-    );
+
+    return createResponse({ success: true, message: "Pallet added to existing row" });
   }
-  
-  return createResponse({ success: true, message: 'Pallet added to sheet' });
-}
 
-// Format parts list for display
-function formatPartsList(parts) {
-  if (!parts || parts.length === 0) return '';
-  
-  return parts.map(part => `${part.part_number} (×${part.quantity})`).join(', ');
-}
+  sheet.appendRow([
+    productId,
+    location,
+    palletQty,
+    productQty,
+    currentUnits,
+    parts,
+    dateAdded,
+    scannedBy,
+    "",
+    "",
+    "",
+    "Active"
+  ]);
 
-// Handle removing a pallet completely
-function handleRemovePallet(data) {
-  const sheet = getOrCreateCustomerSheet(data.customer_name || 'Unknown');
-  const productId = data.product_id;
-  const location = data.location;
-  
-  const dataRange = sheet.getDataRange();
-  const values = dataRange.getValues();
-  
-  for (let i = 1; i < values.length; i++) {
-    if (values[i][0] === productId && values[i][1] === location && values[i][7] === 'Active') {
-      const row = i + 1;
-      const palletsBefore = values[i][2];
-      
-      // DELETE the row entirely
-      Logger.log('Complete removal - DELETING row ' + row);
-      sheet.deleteRow(row);
-      Logger.log('Row deleted');
-      
-      // Log to removals sheet
-      logRemoval(
-        data.customer_name || 'Unknown',
-        productId,
-        location,
-        'CHECK_OUT (Complete)',
-        palletsBefore,
-        palletsBefore,
-        0,
-        'Complete removal from inventory - entry deleted'
-      );
-      
-      logActivity(
-        data.customer_name || 'Unknown',
-        productId,
-        location,
-        'CHECK_OUT (Complete)',
-        palletsBefore,
-        palletsBefore,
-        0,
-        'Complete removal from inventory'
-      );
-      
-      return createResponse({ success: true, message: 'Pallet marked as removed' });
-    }
-  }
-  
-  return createResponse({ success: false, message: 'Pallet not found' });
-}
-
-// Handle updating quantity (partial removal)
-function handleUpdateQuantity(data) {
-  Logger.log('handleUpdateQuantity called with data: ' + JSON.stringify(data));
-  
-  const customerName = data.customer_name || 'Unknown';
-  const sheet = getOrCreateCustomerSheet(customerName);
-  const productId = data.product_id;
-  const location = data.location;
-  const newQuantity = parseFloat(data.new_quantity); // Allow decimals like 3.5
-  
-  Logger.log(`Looking for: ${productId} at ${location} for customer ${customerName}`);
-  Logger.log(`New quantity should be: ${newQuantity}`);
-  
-  const dataRange = sheet.getDataRange();
-  const values = dataRange.getValues();
-  
-  for (let i = 1; i < values.length; i++) {
-    if (values[i][0] === productId && values[i][1] === location && values[i][11] === 'Active') {
-      const row = i + 1;
-      const oldQuantity = parseFloat(values[i][2]);
-      const productQty = parseFloat(values[i][3]);
-      const newTotalUnits = newQuantity * productQty;
-      const quantityRemoved = oldQuantity - newQuantity;
-      
-      Logger.log(`Found pallet at row ${row}. Updating from ${oldQuantity} to ${newQuantity} pallets`);
-      
-      if (newQuantity === 0) {
-        // DELETE the row entirely when quantity reaches 0
-        Logger.log('Quantity is 0 - DELETING row ' + row);
-        sheet.deleteRow(row);
-        Logger.log('Row deleted');
-      } else {
-        // Update the quantities AND track the removal
-        const removalDate = new Date();
-        const removalQty = productQty > 0 ? 
-          (quantityRemoved * productQty).toFixed(0) + ' units' : 
-          quantityRemoved.toFixed(2) + ' pallets';
-        const removalBy = data.scanned_by || 'Unknown';
-        
-        sheet.getRange(row, 3).setValue(newQuantity); // Pallets
-        sheet.getRange(row, 5).setValue(newTotalUnits); // Current Units
-        sheet.getRange(row, 9).setValue(removalDate); // Last Removal Date
-        sheet.getRange(row, 10).setValue(removalQty); // Last Removal Qty
-        sheet.getRange(row, 11).setValue(removalBy); // Last Removal By
-        
-        Logger.log(`Updated row ${row}: Pallets=${newQuantity}, Total Units=${newTotalUnits}`);
-        Logger.log(`Removal tracked: ${removalQty} on ${removalDate} by ${removalBy}`);
-      }
-      
-      // Log to removals sheet
-      logRemoval(
-        customerName,
-        productId,
-        location,
-        'PARTIAL_REMOVE',
-        quantityRemoved,
-        oldQuantity,
-        newQuantity,
-        productQty > 0 ? (quantityRemoved * productQty) + ' units removed' : quantityRemoved + ' pallets removed'
-      );
-      
-      // Log to activity
-      logActivity(
-        customerName,
-        productId,
-        location,
-        'PARTIAL_REMOVE',
-        quantityRemoved,
-        oldQuantity,
-        newQuantity,
-        newQuantity === 0 ? 'Removed all pallets - entry deleted' : `Removed ${quantityRemoved} pallets. ${newQuantity} remaining.`
-      );
-      
-      Logger.log('Update complete');
-      return createResponse({ success: true, message: 'Quantity updated' });
-    }
-  }
-  
-  Logger.log('ERROR: Pallet not found in sheet');
-  return createResponse({ success: false, message: 'Pallet not found' });
-}
-
-// Handle partial pallet removal
-function handlePartialRemove(data) {
-  // This is the same as update_quantity
-  return handleUpdateQuantity(data);
-}
-
-// Handle units removal
-function handleUnitsRemove(data) {
-  Logger.log('handleUnitsRemove called with data: ' + JSON.stringify(data));
-  
-  const customerName = data.customer_name || 'Unknown';
-  const sheet = getOrCreateCustomerSheet(customerName);
-  const productId = data.product_id;
-  const location = data.location;
-  const unitsRemoved = data.units_removed;
-  const newPalletQty = data.new_pallet_quantity;
-  const unitsPerPallet = data.units_per_pallet;
-  
-  Logger.log(`Looking for: ${productId} at ${location} for customer ${customerName}`);
-  
-  const dataRange = sheet.getDataRange();
-  const values = dataRange.getValues();
-  
-  for (let i = 1; i < values.length; i++) {
-    if (values[i][0] === productId && values[i][1] === location && values[i][11] === 'Active') {
-      const row = i + 1;
-      const oldPalletQty = parseFloat(values[i][2]);
-      const unitsPerPalletSpec = parseFloat(values[i][3]); // Original spec (never changes)
-      const oldCurrentUnits = parseFloat(values[i][4]); // Actual current units
-      const newCurrentUnits = oldCurrentUnits - unitsRemoved;
-      
-      Logger.log(`Found pallet at row ${row}.`);
-      Logger.log(`Spec: ${unitsPerPalletSpec} units/pallet (constant)`);
-      Logger.log(`Old current: ${oldCurrentUnits} units`);
-      Logger.log(`Removing: ${unitsRemoved} units`);
-      Logger.log(`New current: ${newCurrentUnits} units`);
-      
-      if (newCurrentUnits === 0) {
-        // DELETE the row entirely when all units are gone
-        Logger.log('All units removed - DELETING row ' + row);
-        sheet.deleteRow(row);
-        Logger.log('Row deleted');
-      } else {
-        // Update current units while keeping spec constant
-        const removalDate = new Date();
-        const removalQty = unitsRemoved + ' units';
-        const removalBy = data.scanned_by || 'Unknown';
-        
-        sheet.getRange(row, 3).setValue(newPalletQty); // Pallets (stays same, usually 1)
-        sheet.getRange(row, 4).setValue(unitsPerPalletSpec); // Units/Pallet Spec (NEVER changes)
-        sheet.getRange(row, 5).setValue(newCurrentUnits); // Current Units (updated)
-        sheet.getRange(row, 9).setValue(removalDate); // Last Removal Date
-        sheet.getRange(row, 10).setValue(removalQty); // Last Removal Qty
-        sheet.getRange(row, 11).setValue(removalBy); // Last Removal By
-        
-        Logger.log(`Updated row ${row}: ${newPalletQty} pallets, ${unitsPerPalletSpec} spec, ${newCurrentUnits} current`);
-        Logger.log(`Removal tracked: ${removalQty} on ${removalDate} by ${removalBy}`);
-      }
-      
-      // Log to removals sheet
-      logRemoval(
-        customerName,
-        productId,
-        location,
-        'UNITS_REMOVE',
-        unitsRemoved,
-        oldCurrentUnits,
-        newCurrentUnits,
-        newCurrentUnits === 0 ? 'All units removed - entry deleted' : `Removed ${unitsRemoved} units (${oldCurrentUnits} → ${newCurrentUnits} remaining)`
-      );
-      
-      logActivity(
-        customerName,
-        productId,
-        location,
-        'UNITS_REMOVE',
-        unitsRemoved,
-        oldCurrentUnits,
-        newCurrentUnits,
-        `Removed ${unitsRemoved} units (${oldCurrentUnits} → ${newCurrentUnits}). Spec: ${unitsPerPalletSpec} units/pallet`
-      );
-      
-      Logger.log('Units removal completed successfully');
-      return createResponse({ success: true, message: 'Units removed and sheet updated' });
-    }
-  }
-  
-  Logger.log('ERROR: Pallet not found in sheet');
-  return createResponse({ success: false, message: 'Pallet not found in sheet for customer: ' + customerName });
-}
-
-// Handle syncing all pallets
-function handleSyncAll(data) {
-  const pallets = data.pallets;
-  
-  // Clear all existing customer sheets (but KEEP Activity Log and Removals History)
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheets = ss.getSheets();
-  
-  for (let i = sheets.length - 1; i >= 0; i--) {
-    const sheetName = sheets[i].getName();
-    // Only delete customer tabs, preserve Activity Log and Removals History
-    if (sheetName !== 'Activity Log' && sheetName !== 'Removals History') {
-      ss.deleteSheet(sheets[i]);
-    }
-  }
-  
-  // Add all pallets
-  pallets.forEach(pallet => {
-    const sheet = getOrCreateCustomerSheet(pallet.customer_name);
-    const productQty = pallet.product_quantity || 0;
-    const currentUnits = pallet.current_units || (pallet.pallet_quantity * productQty);
-    const parts = pallet.parts ? formatPartsList(pallet.parts) : '';
-    const scannedBy = pallet.scanned_by || 'Unknown';
-    
-    sheet.appendRow([
-      pallet.product_id,
-      pallet.location,
-      pallet.pallet_quantity,
-      productQty, // Units/Pallet (spec)
-      currentUnits, // Current Units
-      parts,
-      new Date(pallet.date_added),
-      scannedBy, // Scanned In By
-      '', // Last Removal Date (empty for sync)
-      '', // Last Removal Qty (empty for sync)
-      '', // Last Removal By (empty for sync)
-      'Active'
-    ]);
-  });
-  
   logActivity(
-    'SYSTEM',
-    'SYNC_ALL',
-    '-',
-    'SYNC',
+    customerName,
+    productId,
+    location,
+    "CHECK_IN (New)",
+    palletQty,
+    0,
+    palletQty,
+    parts ? "Includes parts list" : "",
+    scannedBy
+  );
+
+  return createResponse({ success: true, message: "Pallet added to sheet" });
+}
+
+function handleRemovePallet(data) {
+  const customerName = data.customer_name || "Unknown";
+  const sheet = getOrCreateCustomerSheet(customerName);
+
+  const productId = data.product_id || "";
+  const location = data.location || "";
+  const removedBy = data.scanned_by || "Unknown";
+
+  const values = sheet.getDataRange().getValues();
+
+  for (let i = 1; i < values.length; i++) {
+    const isMatch = values[i][0] === productId && values[i][1] === location;
+    const isActive = values[i][11] === "Active";
+    if (isMatch && isActive) {
+      const row = i + 1;
+      const palletsBefore = Number(values[i][2] || 0);
+      const unitsBefore = Number(values[i][4] || 0);
+
+      sheet.deleteRow(row);
+
+      logRemoval(
+        customerName,
+        productId,
+        location,
+        "CHECK_OUT (Complete)",
+        palletsBefore,
+        palletsBefore,
+        0,
+        "Complete removal from inventory - entry deleted",
+        removedBy
+      );
+
+      logActivity(
+        customerName,
+        productId,
+        location,
+        "CHECK_OUT (Complete)",
+        palletsBefore,
+        palletsBefore,
+        0,
+        `Removed row (units before: ${unitsBefore})`,
+        removedBy
+      );
+
+      return createResponse({ success: true, message: "Pallet removed (row deleted)" });
+    }
+  }
+
+  return createResponse({ success: false, message: "Pallet not found" });
+}
+
+function handleUpdateQuantity(data) {
+  const customerName = data.customer_name || "Unknown";
+  const sheet = getOrCreateCustomerSheet(customerName);
+
+  const productId = data.product_id || "";
+  const location = data.location || "";
+  const newQuantity = Number(data.new_quantity);
+  const scannedBy = data.scanned_by || "Unknown";
+
+  const values = sheet.getDataRange().getValues();
+
+  for (let i = 1; i < values.length; i++) {
+    const isMatch = values[i][0] === productId && values[i][1] === location;
+    const isActive = values[i][11] === "Active";
+    if (!isMatch || !isActive) continue;
+
+    const row = i + 1;
+    const oldQuantity = Number(values[i][2] || 0);
+    const unitsPerPalletSpec = Number(values[i][3] || 0);
+
+    const quantityRemoved = oldQuantity - newQuantity;
+
+    if (isNaN(newQuantity)) {
+      return createResponse({ success: false, message: "new_quantity is not a number" });
+    }
+
+    if (newQuantity <= 0) {
+      sheet.deleteRow(row);
+
+      logRemoval(
+        customerName,
+        productId,
+        location,
+        "PARTIAL_REMOVE (All)",
+        quantityRemoved,
+        oldQuantity,
+        0,
+        "Removed all pallets - entry deleted",
+        scannedBy
+      );
+
+      logActivity(
+        customerName,
+        productId,
+        location,
+        "PARTIAL_REMOVE (All)",
+        quantityRemoved,
+        oldQuantity,
+        0,
+        "Removed all pallets - entry deleted",
+        scannedBy
+      );
+
+      return createResponse({ success: true, message: "Quantity updated (row deleted)" });
+    }
+
+    const newTotalUnits = unitsPerPalletSpec > 0 ? (newQuantity * unitsPerPalletSpec) : values[i][4];
+
+    sheet.getRange(row, 3).setValue(newQuantity);
+    sheet.getRange(row, 5).setValue(newTotalUnits);
+
+    sheet.getRange(row, 9).setValue(new Date());
+    sheet.getRange(row, 10).setValue(
+      unitsPerPalletSpec > 0
+        ? `${Math.round(quantityRemoved * unitsPerPalletSpec)} units`
+        : `${quantityRemoved} pallets`
+    );
+    sheet.getRange(row, 11).setValue(scannedBy);
+
+    logRemoval(
+      customerName,
+      productId,
+      location,
+      "PARTIAL_REMOVE",
+      quantityRemoved,
+      oldQuantity,
+      newQuantity,
+      unitsPerPalletSpec > 0
+        ? `${Math.round(quantityRemoved * unitsPerPalletSpec)} units removed`
+        : `${quantityRemoved} pallets removed`,
+      scannedBy
+    );
+
+    logActivity(
+      customerName,
+      productId,
+      location,
+      "PARTIAL_REMOVE",
+      quantityRemoved,
+      oldQuantity,
+      newQuantity,
+      `Removed ${quantityRemoved} pallets. ${newQuantity} remaining.`,
+      scannedBy
+    );
+
+    return createResponse({ success: true, message: "Quantity updated" });
+  }
+
+  return createResponse({ success: false, message: "Pallet not found" });
+}
+
+function handleUnitsRemove(data) {
+  const customerName = data.customer_name || "Unknown";
+  const sheet = getOrCreateCustomerSheet(customerName);
+
+  const productId = data.product_id || "";
+  const location = data.location || "";
+  const unitsRemoved = Number(data.units_removed || 0);
+  const scannedBy = data.scanned_by || "Unknown";
+
+  const values = sheet.getDataRange().getValues();
+
+  for (let i = 1; i < values.length; i++) {
+    const isMatch = values[i][0] === productId && values[i][1] === location;
+    const isActive = values[i][11] === "Active";
+    if (!isMatch || !isActive) continue;
+
+    const row = i + 1;
+
+    const unitsPerPalletSpec = Number(values[i][3] || 0);
+    const oldCurrentUnits = Number(values[i][4] || 0);
+    const newCurrentUnits = oldCurrentUnits - unitsRemoved;
+
+    if (newCurrentUnits <= 0) {
+      sheet.deleteRow(row);
+
+      logRemoval(
+        customerName,
+        productId,
+        location,
+        "UNITS_REMOVE (All)",
+        unitsRemoved,
+        oldCurrentUnits,
+        0,
+        "All units removed - entry deleted",
+        scannedBy
+      );
+
+      logActivity(
+        customerName,
+        productId,
+        location,
+        "UNITS_REMOVE (All)",
+        unitsRemoved,
+        oldCurrentUnits,
+        0,
+        `Removed all units. Spec: ${unitsPerPalletSpec} units/pallet`,
+        scannedBy
+      );
+
+      return createResponse({ success: true, message: "All units removed (row deleted)" });
+    }
+
+    sheet.getRange(row, 5).setValue(newCurrentUnits);
+
+    sheet.getRange(row, 9).setValue(new Date());
+    sheet.getRange(row, 10).setValue(`${unitsRemoved} units`);
+    sheet.getRange(row, 11).setValue(scannedBy);
+
+    logRemoval(
+      customerName,
+      productId,
+      location,
+      "UNITS_REMOVE",
+      unitsRemoved,
+      oldCurrentUnits,
+      newCurrentUnits,
+      `Removed ${unitsRemoved} units (${oldCurrentUnits} -> ${newCurrentUnits})`,
+      scannedBy
+    );
+
+    logActivity(
+      customerName,
+      productId,
+      location,
+      "UNITS_REMOVE",
+      unitsRemoved,
+      oldCurrentUnits,
+      newCurrentUnits,
+      `Removed ${unitsRemoved} units. Spec: ${unitsPerPalletSpec} units/pallet`,
+      scannedBy
+    );
+
+    return createResponse({ success: true, message: "Units removed and sheet updated" });
+  }
+
+  return createResponse({ success: false, message: "Pallet not found in sheet for customer: " + customerName });
+}
+
+function handleSyncAll(data) {
+  const pallets = Array.isArray(data.pallets) ? data.pallets : [];
+
+  let added = 0;
+  let updated = 0;
+  let skipped = 0;
+
+  pallets.forEach(p => {
+    const customerName = p.customer_name || "Unknown";
+    const sheet = getOrCreateCustomerSheet(customerName);
+
+    const productId = p.product_id || "";
+    const location = p.location || "";
+    const productQty = Number(p.product_quantity || 0);
+
+    const currentUnits = (p.current_units !== undefined && p.current_units !== null)
+      ? Number(p.current_units)
+      : Number(p.pallet_quantity || 0) * productQty;
+
+    const parts = p.parts ? formatPartsList(p.parts) : "";
+    const scannedBy = p.scanned_by || "Unknown";
+    const dateAdded = p.date_added ? new Date(p.date_added) : new Date();
+
+    const values = sheet.getDataRange().getValues();
+    let existingRow = -1;
+
+    for (let i = 1; i < values.length; i++) {
+      const isMatch = values[i][0] === productId && values[i][1] === location;
+      const isActive = values[i][11] === "Active";
+      if (isMatch && isActive) {
+        existingRow = i + 1;
+        break;
+      }
+    }
+
+    if (existingRow > 0) {
+      const palletsInSheet = Number(values[existingRow - 1][2] || 0);
+      const unitsInSheet = Number(values[existingRow - 1][4] || 0);
+
+      if (palletsInSheet !== Number(p.pallet_quantity || 0) || unitsInSheet !== currentUnits) {
+        sheet.getRange(existingRow, 3).setValue(Number(p.pallet_quantity || 0));
+        sheet.getRange(existingRow, 4).setValue(productQty);
+        sheet.getRange(existingRow, 5).setValue(currentUnits);
+        updated++;
+      } else {
+        skipped++;
+      }
+    } else {
+      sheet.appendRow([
+        productId,
+        location,
+        Number(p.pallet_quantity || 0),
+        productQty,
+        currentUnits,
+        parts,
+        dateAdded,
+        scannedBy,
+        "",
+        "",
+        "",
+        "Active"
+      ]);
+      added++;
+    }
+  });
+
+  logActivity(
+    "SYSTEM",
+    "SYNC_ALL",
+    "-",
+    "SYNC",
     pallets.length,
     0,
     pallets.length,
-    `Full sync completed: ${pallets.length} pallets across ${ss.getSheets().length - 2} customers (preserved Activity Log and Removals History)`
+    `Smart sync: ${added} added, ${updated} updated, ${skipped} unchanged`,
+    "SYSTEM"
   );
-  
-  return createResponse({ 
-    success: true, 
-    message: `Synced ${pallets.length} pallets across ${ss.getSheets().length - 2} customer sheets. History preserved.` 
+
+  return createResponse({
+    success: true,
+    message: `Smart sync complete: ${added} added, ${updated} updated, ${skipped} unchanged. Removal history preserved.`
   });
 }
 
-// Test function - you can run this from the Apps Script editor to test
-function testConnection() {
-  Logger.log('Test connection successful!');
-  return 'Google Apps Script is working correctly!';
+// ✅ New handler: daily snapshot UPSERT (no duplicate rows for same date+customer)
+function handleDailySnapshot(data) {
+  const sheet = getOrCreateDailyStorageSheet();
+
+  const dateStr = String(data.date || "").trim(); // YYYY-MM-DD
+  const customer = String(data.customer_name || "Unknown").trim();
+  const qty = Number(data.pallets_in_storage || 0);
+
+  if (!dateStr) {
+    return createResponse({ success: false, message: "daily_snapshot missing date" });
+  }
+
+  const tz = Session.getScriptTimeZone();
+  const values = sheet.getDataRange().getValues();
+
+  // Find existing row with same Date+Customer
+  // Row format: [Date, Customer, Pallets in Storage]
+  let foundRow = -1;
+
+  for (let i = 1; i < values.length; i++) {
+    const cellDate = values[i][0];
+    const cellCustomer = String(values[i][1] || "").trim();
+
+    const normalizedCellDate =
+      cellDate instanceof Date
+        ? Utilities.formatDate(cellDate, tz, "yyyy-MM-dd")
+        : String(cellDate || "").trim();
+
+    if (normalizedCellDate === dateStr && cellCustomer === customer) {
+      foundRow = i + 1;
+      break;
+    }
+  }
+
+  if (foundRow > 0) {
+    sheet.getRange(foundRow, 3).setValue(qty);
+  } else {
+    // Store as a proper Date in the sheet
+    const dateObj = new Date(dateStr + "T00:00:00");
+    sheet.appendRow([dateObj, customer, qty]);
+  }
+
+  logActivity(
+    customer,
+    "DAILY_SNAPSHOT",
+    "-",
+    "DAILY_SNAPSHOT",
+    qty,
+    "",
+    qty,
+    `Snapshot recorded for ${dateStr}`,
+    "SYSTEM"
+  );
+
+  return createResponse({ success: true, message: "Daily snapshot recorded", date: dateStr, customer, qty });
 }

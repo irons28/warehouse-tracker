@@ -1,25 +1,44 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Warehouse Tracker</title>
-  
-  <!-- External Libraries -->
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script src="https://unpkg.com/html5-qrcode"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-  
-  <!-- Custom Styles -->
-  <link rel="stylesheet" href="styles.css">
-</head>
-<body class="bg-gray-100">
-  <div id="app"></div>
-  <div id="toast-container"></div>
-  <div id="modal-container"></div>
-  
-  <!-- Custom Application Script -->
-  <script src="app.js"></script>
-</body>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Warehouse Tracker</title>
+
+    <!-- Tailwind CDN (ok for now while building) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <!-- App CSS -->
+    <link rel="stylesheet" href="/styles.css" />
+
+    <!-- Socket.IO client -->
+    <script src="/socket.io/socket.io.js"></script>
+
+    <!-- QR + Chart libs -->
+    <script src="https://unpkg.com/html5-qrcode"></script>
+    <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  </head>
+
+  <body class="bg-slate-50">
+    <!-- SINGLE app mount point -->
+    <div id="app"></div>
+
+    <!-- Service worker (fixed) -->
+    <script>
+      (function () {
+        if (!("serviceWorker" in navigator)) return;
+
+        window.addEventListener("load", () => {
+          navigator.serviceWorker
+            .register("/sw.js?v=" + Date.now())
+            .then(() => console.log("✅ Service worker registered"))
+            .catch((e) => console.warn("⚠️ Service worker registration failed:", e));
+        });
+      })();
+    </script>
+
+    <!-- Your app logic -->
+    <script src="/app.js"></script>
+  </body>
 </html>
