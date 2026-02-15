@@ -10,6 +10,7 @@ const fs = require("fs");
 const app = express();
 const PORT = process.env.PORT || 3000;
 const HTTPS_PORT = process.env.HTTPS_PORT || 3443;
+const settingsPath = path.join(__dirname, "server-settings.json");
 
 // Middleware
 app.use(cors());
@@ -53,9 +54,32 @@ io.on("connection", (socket) => {
 function broadcastInventoryChange(action, data) {
   try {
     console.log(`📡 Broadcasting: ${action}`);
-    io.emit("inventory_update", { action, data, timestamp: Date.now() });
+    const payload = { action, data, timestamp: Date.now() };
+    io.emit("inventory_update", payload);
+    // Backward-compat for older client listeners
+    io.emit("db_updated", payload);
   } catch (e) {
     console.error("Broadcast failed:", e);
+  }
+}
+
+function safeParseParts(partsValue) {
+  if (!partsValue) return null;
+  try {
+    return JSON.parse(partsValue);
+  } catch {
+    return null;
+  }
+}
+
+function readServerSettings() {
+  try {
+    if (!fs.existsSync(settingsPath)) return {};
+    const raw = fs.readFileSync(settingsPath, "utf8");
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
   }
 }
 
@@ -112,7 +136,7 @@ db.serialize(() => {
             console.log("✓ current_units column added");
             setTimeout(() => {
               db.run(
-                "UPDATE pallets SET current_units = product_quantity WHERE current_units IS NULL OR current_units = 0",
+                "UPDATE pallets SET current_units = product_quantity * pallet_quantity WHERE current_units IS NULL OR current_units = 0",
                 (err) => {
                   if (err) console.error("Error initializing current_units:", err);
                   else console.log("✓ current_units initialized");
@@ -260,7 +284,7 @@ app.get("/api/pallets", (req, res) => {
 
     const palletsWithParts = rows.map((row) => ({
       ...row,
-      parts: row.parts ? JSON.parse(row.parts) : null,
+      parts: safeParseParts(row.parts),
     }));
 
     res.json(palletsWithParts);
@@ -278,7 +302,7 @@ app.get("/api/pallets/search", (req, res) => {
 
       const palletsWithParts = rows.map((row) => ({
         ...row,
-        parts: row.parts ? JSON.parse(row.parts) : null,
+        parts: safeParseParts(row.parts),
       }));
 
       res.json(palletsWithParts);
@@ -305,7 +329,9 @@ app.post("/api/pallets", (req, res) => {
 
   const palletId = id || `PLT-${Date.now()}`;
   const partsJson = parts ? JSON.stringify(parts) : null;
-  const currentUnits = product_quantity || 0;
+  const palletQty = Number(pallet_quantity) || 1;
+  const unitsPerPallet = Number(product_quantity) || 0;
+  const currentUnits = palletQty * unitsPerPallet;
   const scannedByPerson = scanned_by || "Unknown";
 
   db.run(
@@ -314,8 +340,8 @@ app.post("/api/pallets", (req, res) => {
       palletId,
       customer_name,
       product_id,
-      pallet_quantity || 1,
-      product_quantity || 0,
+      palletQty,
+      unitsPerPallet,
       currentUnits,
       location,
       partsJson,
@@ -333,8 +359,8 @@ app.post("/api/pallets", (req, res) => {
           customer_name,
           product_id,
           "CHECK_IN",
-          pallet_quantity || 1,
-          pallet_quantity || 1,
+          palletQty,
+          palletQty,
           location,
         ]
       );
@@ -343,8 +369,8 @@ app.post("/api/pallets", (req, res) => {
         id: palletId,
         customer_name,
         product_id,
-        pallet_quantity: pallet_quantity || 1,
-        product_quantity: product_quantity || 0,
+        pallet_quantity: palletQty,
+        product_quantity: unitsPerPallet,
         location,
         parts: parts || null,
         message: "Pallet checked in successfully",
@@ -354,8 +380,8 @@ app.post("/api/pallets", (req, res) => {
         id: palletId,
         customer_name,
         product_id,
-        pallet_quantity: pallet_quantity || 1,
-        product_quantity: product_quantity || 0,
+        pallet_quantity: palletQty,
+        product_quantity: unitsPerPallet,
         current_units: currentUnits,
         location,
         parts,
@@ -497,8 +523,7 @@ app.post("/api/pallets/:id/remove-units", (req, res) => {
         });
       }
 
-      const currentUnits = row.current_units || row.product_quantity;
-      const totalUnits = row.pallet_quantity * currentUnits;
+      const totalUnits = Number(row.current_units) || 0;
       const unitsAfter = totalUnits - units_to_remove;
 
       if (unitsAfter < 0) {
@@ -509,7 +534,7 @@ app.post("/api/pallets/:id/remove-units", (req, res) => {
 
       if (unitsAfter === 0) {
         db.run(
-          'UPDATE pallets SET status = "removed", date_removed = CURRENT_TIMESTAMP, pallet_quantity = 0, product_quantity = 0 WHERE id = ?',
+          'UPDATE pallets SET status = "removed", date_removed = CURRENT_TIMESTAMP, pallet_quantity = 0, product_quantity = 0, current_units = 0 WHERE id = ?',
           [row.id],
           (err) => {
             if (err) return res.status(500).json({ error: err.message });
@@ -567,13 +592,13 @@ app.post("/api/pallets/:id/remove-units", (req, res) => {
                 totalUnits,
                 unitsAfter,
                 row.location,
-                `Removed ${units_to_remove} units. ${unitsAfter} of ${row.product_quantity} units remaining on pallet.`,
+                `Removed ${units_to_remove} units. ${unitsAfter} total units remaining.`,
                 scannedByPerson,
               ]
             );
 
             res.json({
-              message: `Removed ${units_to_remove} units. ${unitsAfter} of ${row.product_quantity} units remaining on pallet.`,
+              message: `Removed ${units_to_remove} units. ${unitsAfter} total units remaining.`,
               units_removed: units_to_remove,
               units_remaining: unitsAfter,
               pallets_remaining: row.pallet_quantity,
@@ -748,6 +773,54 @@ app.get("/api/customers", (req, res) => {
       res.json(rows.map((r) => r.customer_name));
     }
   );
+});
+
+app.get("/api/settings", (req, res) => {
+  const settings = readServerSettings();
+  res.json({
+    googleSheetsUrl: settings.googleSheetsUrl || settings.appsScriptUrl || "",
+    appsScriptUrl: settings.appsScriptUrl || settings.googleSheetsUrl || "",
+  });
+});
+
+app.post("/api/sheets/test", async (req, res) => {
+  const settings = readServerSettings();
+  const url = String(settings.googleSheetsUrl || settings.appsScriptUrl || "").trim();
+  if (!url) {
+    return res.status(400).json({ error: "Google Sheets URL not configured in server-settings.json" });
+  }
+
+  try {
+    const response = await fetch(url, { method: "GET" });
+    if (!response.ok) {
+      return res.status(502).json({ error: `Sheets endpoint responded ${response.status}` });
+    }
+    return res.json({ ok: true, message: "Google Sheets endpoint reachable" });
+  } catch (err) {
+    return res.status(502).json({ error: err.message || "Failed to reach Google Sheets endpoint" });
+  }
+});
+
+app.post("/api/sheets/sync", async (req, res) => {
+  const settings = readServerSettings();
+  const url = String(settings.googleSheetsUrl || settings.appsScriptUrl || "").trim();
+  if (!url) {
+    return res.status(400).json({ error: "Google Sheets URL not configured in server-settings.json" });
+  }
+
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source: "warehouse-tracker", trigger: "manual-sync" }),
+    });
+    if (!response.ok) {
+      return res.status(502).json({ error: `Sheets sync failed (${response.status})` });
+    }
+    return res.json({ ok: true, message: "Sync request sent to Google Sheets" });
+  } catch (err) {
+    return res.status(502).json({ error: err.message || "Failed to call Google Sheets sync endpoint" });
+  }
 });
 
 // Local IP helper

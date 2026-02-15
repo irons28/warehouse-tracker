@@ -24,11 +24,16 @@
     <!-- SINGLE app mount point -->
     <div id="app"></div>
 
-    <!-- Service worker (fixed) -->
+    <!-- Toast mount point (REQUIRED if app.js uses showToast) -->
+    <div id="toast-container"></div>
+
+    <!-- Global modal mount point (REQUIRED if app.js uses showModal/prompt) -->
+    <div id="modal-container"></div>
+
+    <!-- Service worker -->
     <script>
       (function () {
         if (!("serviceWorker" in navigator)) return;
-
         window.addEventListener("load", () => {
           navigator.serviceWorker
             .register("/sw.js?v=" + Date.now())

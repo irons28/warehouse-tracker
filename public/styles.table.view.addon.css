@@ -1,0 +1,29 @@
+/* === Table view add-on (keeps your existing look, just styles the new table buttons) === */
+.warehouse-table { width: 100%; border-collapse: separate; border-spacing: 0; }
+.warehouse-table th, .warehouse-table td { white-space: nowrap; }
+.warehouse-table thead th { border-bottom: 1px solid #e5e7eb; }
+.warehouse-table tbody td { border-bottom: 1px solid #f3f4f6; }
+
+/* Compact action buttons inside table */
+.btn-table{
+  border: none;
+  padding: 8px 10px;
+  border-radius: 12px;
+  font-weight: 800;
+  font-size: 12px;
+  line-height: 1;
+  color: white;
+  cursor: pointer;
+  box-shadow: 0 6px 14px rgba(0,0,0,.12);
+  transition: transform .05s ease, filter .15s ease;
+}
+.btn-table:active{ transform: translateY(1px); }
+.btn-table:hover{ filter: brightness(0.95); }
+
+.btn-blue{ background: #3b82f6; }
+.btn-purple{ background: #a855f7; }
+.btn-orange{ background: #f97316; }
+.btn-yellow{ background: #eab308; color: #111827; }
+
+/* Make sticky header actually stick inside overflow container */
+.warehouse-table thead.sticky{ position: sticky; top: 0; z-index: 10; }

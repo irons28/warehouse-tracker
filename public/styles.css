@@ -326,3 +326,332 @@ body{
 .wt-btn-purple{ border-color: rgba(168,85,247,0.35); }
 .wt-btn-orange{ border-color: rgba(249,115,22,0.35); }
 .wt-btn-yellow{ border-color: rgba(234,179,8,0.35); }
+
+/* =========================
+   Warehouse Tracker Modals
+   ========================= */
+
+#modal-container {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  pointer-events: none; /* children enable pointer events */
+}
+
+.wt-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(15, 23, 42, 0.45); /* slate overlay */
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  pointer-events: auto;
+}
+
+.wt-modal {
+  width: min(920px, 92vw);
+  max-height: 90vh;
+  overflow: auto;
+  background: #ffffff;
+  border-radius: 18px;
+  box-shadow: 0 25px 60px rgba(0, 0, 0, 0.25);
+  border: 1px solid rgba(148, 163, 184, 0.35);
+}
+
+.wt-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 18px 20px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.35);
+}
+
+.wt-modal-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 800;
+  color: #0f172a;
+}
+
+.wt-modal-close {
+  border: 0;
+  background: transparent;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 6px 10px;
+  border-radius: 10px;
+  color: #334155;
+}
+.wt-modal-close:hover {
+  background: rgba(15, 23, 42, 0.06);
+}
+
+.wt-modal-body {
+  padding: 18px 20px;
+}
+
+.wt-modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 16px 20px;
+  border-top: 1px solid rgba(148, 163, 184, 0.35);
+}
+
+.wt-btn {
+  border: 0;
+  cursor: pointer;
+  border-radius: 12px;
+  padding: 10px 14px;
+  font-weight: 700;
+}
+
+.wt-btn-secondary {
+  background: #e2e8f0;
+  color: #0f172a;
+}
+.wt-btn-secondary:hover {
+  background: #cbd5e1;
+}
+
+.wt-btn-primary {
+  background: #2563eb;
+  color: #ffffff;
+}
+.wt-btn-primary:hover {
+  background: #1d4ed8;
+}
+
+/* =========================
+   Toasts
+   ========================= */
+
+#toast-container {
+  position: fixed;
+  top: 14px;
+  right: 14px;
+  z-index: 10000;
+  display: grid;
+  gap: 10px;
+  pointer-events: none;
+}
+
+.wt-toast {
+  pointer-events: auto;
+  min-width: 260px;
+  max-width: 360px;
+  background: #0f172a;
+  color: #fff;
+  border-radius: 14px;
+  padding: 12px 14px;
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.25);
+  border: 1px solid rgba(148, 163, 184, 0.25);
+}
+
+.wt-toast.success { background: #065f46; }
+.wt-toast.error { background: #991b1b; }
+.wt-toast.warning { background: #92400e; }
+
+/* =========================
+   Modal + Toast containers
+   ========================= */
+
+#modal-container {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  pointer-events: none; /* modal enables pointer-events on backdrop */
+}
+
+#toast-container {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  z-index: 10000;
+  pointer-events: none;
+}
+
+/* Backdrop */
+.wt-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.45); /* slate-ish overlay */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  pointer-events: auto;
+}
+
+/* Modal panel */
+.wt-modal-panel {
+  width: min(980px, 100%);
+  max-height: min(80vh, 820px);
+  overflow: auto;
+  background: #fff;
+  border-radius: 16px;
+  box-shadow: 0 30px 80px rgba(0,0,0,0.25);
+  border: 1px solid rgba(15, 23, 42, 0.12);
+}
+
+/* Header / body / footer helpers (if your modal uses them) */
+.wt-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 18px 20px;
+  border-bottom: 1px solid rgba(15, 23, 42, 0.08);
+}
+
+.wt-modal-body {
+  padding: 18px 20px;
+}
+
+.wt-modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+  padding: 16px 20px;
+  border-top: 1px solid rgba(15, 23, 42, 0.08);
+}
+
+/* Close button (if your modal outputs one) */
+.wt-modal-close {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 6px 10px;
+  border-radius: 10px;
+}
+.wt-modal-close:hover {
+  background: rgba(15, 23, 42, 0.06);
+}
+
+/* =========================
+   MODAL SYSTEM
+========================= */
+
+.wt-modal-root {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  z-index: 2000;
+}
+
+.wt-modal-root.hidden {
+  display: none;
+}
+
+.wt-modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.55);
+  backdrop-filter: blur(6px);
+}
+
+.wt-modal-panel {
+  position: relative;
+  width: min(520px, calc(100vw - 32px));
+  max-height: 85vh;
+  overflow: hidden;
+
+  background: var(--card);
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+
+  display: flex;
+  flex-direction: column;
+
+  transform: translateY(8px);
+  opacity: 0;
+  animation: wtModalIn 180ms ease forwards;
+}
+
+@keyframes wtModalIn {
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.wt-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px 20px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.wt-modal-title {
+  font-size: 1.1rem;
+  font-weight: 700;
+}
+
+.wt-modal-body {
+  padding: 18px 20px;
+  overflow: auto;
+}
+
+.wt-modal-footer {
+  padding: 14px 20px;
+  border-top: 1px solid var(--border);
+  background: rgba(15, 23, 42, 0.02);
+
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.wt-modal-close {
+  border: none;
+  background: transparent;
+  font-size: 1.1rem;
+  cursor: pointer;
+  padding: 6px 8px;
+  border-radius: 10px;
+}
+
+.wt-modal-close:hover {
+  background: rgba(15, 23, 42, 0.08);
+}
+
+.wt-btn {
+  border: 1px solid var(--border);
+  background: #fff;
+  border-radius: 12px;
+  padding: 10px 16px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 150ms ease;
+}
+
+.wt-btn:active {
+  transform: translateY(1px);
+}
+
+.wt-btn-primary {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+}
+
+.wt-btn-primary:hover {
+  filter: brightness(.95);
+}
+
+.wt-btn-danger {
+  background: #ef4444;
+  color: #fff;
+  border: none;
+}
