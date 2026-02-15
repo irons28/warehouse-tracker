@@ -832,6 +832,7 @@ db.serialize(() => {
     rate_per_pallet_week REAL NOT NULL DEFAULT 0,
     handling_fee_flat REAL NOT NULL DEFAULT 0,
     handling_fee_per_pallet REAL NOT NULL DEFAULT 0,
+    payment_terms_days INTEGER NOT NULL DEFAULT 7,
     currency TEXT NOT NULL DEFAULT 'GBP',
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
   )`);
@@ -842,6 +843,7 @@ db.serialize(() => {
     const hasDayRate = columns.some((c) => c.name === "rate_per_pallet_day");
     const hasHandlingFlat = columns.some((c) => c.name === "handling_fee_flat");
     const hasHandlingPerPallet = columns.some((c) => c.name === "handling_fee_per_pallet");
+    const hasPaymentTermsDays = columns.some((c) => c.name === "payment_terms_days");
     const hasCurrency = columns.some((c) => c.name === "currency");
 
     if (!hasWeekRate) {
@@ -852,6 +854,7 @@ db.serialize(() => {
     }
     if (!hasHandlingFlat) db.run("ALTER TABLE customer_rates ADD COLUMN handling_fee_flat REAL NOT NULL DEFAULT 0");
     if (!hasHandlingPerPallet) db.run("ALTER TABLE customer_rates ADD COLUMN handling_fee_per_pallet REAL NOT NULL DEFAULT 0");
+    if (!hasPaymentTermsDays) db.run("ALTER TABLE customer_rates ADD COLUMN payment_terms_days INTEGER NOT NULL DEFAULT 7");
     if (!hasCurrency) db.run("ALTER TABLE customer_rates ADD COLUMN currency TEXT NOT NULL DEFAULT 'GBP'");
   });
 
@@ -871,6 +874,8 @@ db.serialize(() => {
     handling_total REAL NOT NULL DEFAULT 0,
     total REAL NOT NULL,
     currency TEXT NOT NULL DEFAULT 'GBP',
+    payment_terms_days INTEGER NOT NULL DEFAULT 7,
+    due_date TEXT,
     details_json TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   )`);
@@ -886,6 +891,8 @@ db.serialize(() => {
     if (!has("base_total")) db.run("ALTER TABLE invoices ADD COLUMN base_total REAL NOT NULL DEFAULT 0");
     if (!has("handling_total")) db.run("ALTER TABLE invoices ADD COLUMN handling_total REAL NOT NULL DEFAULT 0");
     if (!has("currency")) db.run("ALTER TABLE invoices ADD COLUMN currency TEXT NOT NULL DEFAULT 'GBP'");
+    if (!has("payment_terms_days")) db.run("ALTER TABLE invoices ADD COLUMN payment_terms_days INTEGER NOT NULL DEFAULT 7");
+    if (!has("due_date")) db.run("ALTER TABLE invoices ADD COLUMN due_date TEXT");
     if (!has("details_json")) db.run("ALTER TABLE invoices ADD COLUMN details_json TEXT");
     if (!has("status")) db.run("ALTER TABLE invoices ADD COLUMN status TEXT NOT NULL DEFAULT 'DRAFT'");
     if (!has("sent_at")) db.run("ALTER TABLE invoices ADD COLUMN sent_at TEXT");
@@ -985,10 +992,12 @@ function buildInvoicePreview(input, done) {
   const rateOverrideRaw = input?.rate_per_pallet_week;
   const handlingFlatOverrideRaw = input?.handling_fee_flat;
   const handlingPerPalletOverrideRaw = input?.handling_fee_per_pallet;
+  const paymentTermsOverrideRaw = input?.payment_terms_days;
 
   const rateOverride = Number(rateOverrideRaw);
   const handlingFlatOverride = Number(handlingFlatOverrideRaw);
   const handlingPerPalletOverride = Number(handlingPerPalletOverrideRaw);
+  const paymentTermsOverride = Number(paymentTermsOverrideRaw);
 
   if (!customerName || !startDate || !endDate) {
     return done(new Error("customer_name, start_date, end_date are required"));
@@ -1003,10 +1012,12 @@ function buildInvoicePreview(input, done) {
       const hasRateOverride = rateOverrideRaw !== undefined && rateOverrideRaw !== null && rateOverrideRaw !== "";
       const hasFlatOverride = handlingFlatOverrideRaw !== undefined && handlingFlatOverrideRaw !== null && handlingFlatOverrideRaw !== "";
       const hasPerPalletOverride = handlingPerPalletOverrideRaw !== undefined && handlingPerPalletOverrideRaw !== null && handlingPerPalletOverrideRaw !== "";
+      const hasTermsOverride = paymentTermsOverrideRaw !== undefined && paymentTermsOverrideRaw !== null && paymentTermsOverrideRaw !== "";
 
       const ratePerWeek = hasRateOverride ? rateOverride : Number(rateRow?.rate_per_pallet_week || 0);
       const handlingFlat = hasFlatOverride ? handlingFlatOverride : Number(rateRow?.handling_fee_flat || 0);
       const handlingPerPallet = hasPerPalletOverride ? handlingPerPalletOverride : Number(rateRow?.handling_fee_per_pallet || 0);
+      const paymentTermsDays = hasTermsOverride ? paymentTermsOverride : Number(rateRow?.payment_terms_days ?? 7);
       const currency = String(rateRow?.currency || "GBP");
 
       if (!Number.isFinite(ratePerWeek) || ratePerWeek < 0) {
@@ -1018,10 +1029,14 @@ function buildInvoicePreview(input, done) {
       if (!Number.isFinite(handlingPerPallet) || handlingPerPallet < 0) {
         return done(new Error("handling_fee_per_pallet must be a valid number >= 0"));
       }
+      if (!Number.isInteger(paymentTermsDays) || paymentTermsDays < 0 || paymentTermsDays > 365) {
+        return done(new Error("payment_terms_days must be an integer between 0 and 365"));
+      }
 
       const baseTotal = Number((metrics.pallet_weeks * ratePerWeek).toFixed(2));
       const handlingTotal = Number((handlingFlat + (handlingPerPallet * metrics.handled_pallets)).toFixed(2));
       const grandTotal = Number((baseTotal + handlingTotal).toFixed(2));
+      const dueDate = addDaysYmd(endDate, paymentTermsDays);
 
       return done(null, {
         ok: true,
@@ -1036,6 +1051,8 @@ function buildInvoicePreview(input, done) {
         rate_per_pallet_week: ratePerWeek,
         handling_fee_flat: handlingFlat,
         handling_fee_per_pallet: handlingPerPallet,
+        payment_terms_days: paymentTermsDays,
+        due_date: dueDate,
         currency,
         base_total: baseTotal,
         handling_total: handlingTotal,
@@ -1067,6 +1084,7 @@ app.post("/api/rates", (req, res) => {
   const ratePerWeek = Number(req.body?.rate_per_pallet_week);
   const handlingFlat = Number(req.body?.handling_fee_flat || 0);
   const handlingPerPallet = Number(req.body?.handling_fee_per_pallet || 0);
+  const paymentTermsDays = Number(req.body?.payment_terms_days ?? 7);
   const currency = String(req.body?.currency || "GBP").trim() || "GBP";
 
   if (!customerName || !Number.isFinite(ratePerWeek) || ratePerWeek < 0) {
@@ -1078,17 +1096,21 @@ app.post("/api/rates", (req, res) => {
   if (!Number.isFinite(handlingPerPallet) || handlingPerPallet < 0) {
     return res.status(400).json({ error: "handling_fee_per_pallet must be a valid number >= 0" });
   }
+  if (!Number.isInteger(paymentTermsDays) || paymentTermsDays < 0 || paymentTermsDays > 365) {
+    return res.status(400).json({ error: "payment_terms_days must be an integer between 0 and 365" });
+  }
 
   db.run(
-    `INSERT INTO customer_rates (customer_name, rate_per_pallet_week, handling_fee_flat, handling_fee_per_pallet, currency, updated_at)
-     VALUES (?, ?, ?, ?, ?, datetime('now'))
+    `INSERT INTO customer_rates (customer_name, rate_per_pallet_week, handling_fee_flat, handling_fee_per_pallet, payment_terms_days, currency, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
      ON CONFLICT(customer_name) DO UPDATE SET
        rate_per_pallet_week = excluded.rate_per_pallet_week,
        handling_fee_flat = excluded.handling_fee_flat,
        handling_fee_per_pallet = excluded.handling_fee_per_pallet,
+       payment_terms_days = excluded.payment_terms_days,
        currency = excluded.currency,
        updated_at = datetime('now')`,
-    [customerName, ratePerWeek, handlingFlat, handlingPerPallet, currency],
+    [customerName, ratePerWeek, handlingFlat, handlingPerPallet, paymentTermsDays, currency],
     (err) => {
       if (err) return res.status(500).json({ error: "DB error" });
       db.get("SELECT * FROM customer_rates WHERE customer_name = ?", [customerName], (err2, row) => {
@@ -1139,6 +1161,7 @@ app.post("/api/invoices/generate", (req, res) => {
     rate_per_pallet_week: req.body?.rate_per_pallet_week,
     handling_fee_flat: req.body?.handling_fee_flat,
     handling_fee_per_pallet: req.body?.handling_fee_per_pallet,
+    payment_terms_days: req.body?.payment_terms_days,
   };
 
   buildInvoicePreview(previewInput, (previewErr, preview) => {
@@ -1155,8 +1178,8 @@ app.post("/api/invoices/generate", (req, res) => {
           customer_name, start_date, end_date, billing_cycle, pallet_days,
           rate_per_pallet_day, rate_per_pallet_week,
           handling_fee_flat, handling_fee_per_pallet, handled_pallets,
-          base_total, handling_total, total, currency, details_json, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          base_total, handling_total, total, currency, payment_terms_days, due_date, details_json, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         preview.customer_name,
         preview.start_date,
@@ -1172,6 +1195,8 @@ app.post("/api/invoices/generate", (req, res) => {
         preview.handling_total,
         preview.total,
         preview.currency || "GBP",
+        preview.payment_terms_days,
+        preview.due_date,
         detailsJson,
         "DRAFT",
       ],
@@ -1199,27 +1224,41 @@ app.post("/api/invoices/:id/status", (req, res) => {
     return res.status(400).json({ error: "status must be one of DRAFT, SENT, PAID" });
   }
 
-  const nowIso = new Date().toISOString();
-  let sentAt = null;
-  let paidAt = null;
-  if (status === "SENT") sentAt = nowIso;
-  if (status === "PAID") paidAt = nowIso;
+  db.get("SELECT * FROM invoices WHERE id = ?", [id], (getErr, current) => {
+    if (getErr) return res.status(500).json({ error: "DB error" });
+    if (!current) return res.status(404).json({ error: "Invoice not found" });
 
-  db.run(
-    `UPDATE invoices
-     SET status = ?, sent_at = ?, paid_at = ?
-     WHERE id = ?`,
-    [status, sentAt, paidAt, id],
-    function onStatusUpdated(err) {
-      if (err) return res.status(500).json({ error: "DB error" });
-      if (this.changes === 0) return res.status(404).json({ error: "Invoice not found" });
+    const nowIso = new Date().toISOString();
+    let sentAt = current.sent_at || null;
+    let paidAt = current.paid_at || null;
 
-      db.get("SELECT * FROM invoices WHERE id = ?", [id], (err2, row) => {
-        if (err2) return res.status(500).json({ error: "DB error" });
-        return res.json({ ok: true, invoice: row });
-      });
+    if (status === "DRAFT") {
+      sentAt = null;
+      paidAt = null;
+    } else if (status === "SENT") {
+      sentAt = sentAt || nowIso;
+      paidAt = null;
+    } else if (status === "PAID") {
+      sentAt = sentAt || nowIso;
+      paidAt = nowIso;
     }
-  );
+
+    db.run(
+      `UPDATE invoices
+       SET status = ?, sent_at = ?, paid_at = ?
+       WHERE id = ?`,
+      [status, sentAt, paidAt, id],
+      function onStatusUpdated(err) {
+        if (err) return res.status(500).json({ error: "DB error" });
+        if (this.changes === 0) return res.status(404).json({ error: "Invoice not found" });
+
+        db.get("SELECT * FROM invoices WHERE id = ?", [id], (err2, row) => {
+          if (err2) return res.status(500).json({ error: "DB error" });
+          return res.json({ ok: true, invoice: row });
+        });
+      }
+    );
+  });
 });
 
 // Local IP helper

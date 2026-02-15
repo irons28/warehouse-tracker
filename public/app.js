@@ -168,6 +168,7 @@
       rate_per_pallet_week: "",
       handling_fee_flat: "0",
       handling_fee_per_pallet: "0",
+      payment_terms_days: "7",
       currency: "GBP",
     },
     invoiceFilterCustomer: "",
@@ -562,6 +563,8 @@
         const t = Date.parse(i.created_at || "");
         return Number.isFinite(t) && (now - t) <= 30 * 24 * 60 * 60 * 1000;
       });
+      const overdueInvoices = invoices.filter((inv) => this._invoiceIsOverdue(inv));
+      const overdueAmount = overdueInvoices.reduce((sum, inv) => sum + (Number(inv.total) || 0), 0);
       const revenue30d = invoice30d.reduce((sum, i) => sum + (Number(i.total) || 0), 0);
       const handling30d = invoice30d.reduce((sum, i) => sum + (Number(i.handling_total) || 0), 0);
       const handlingShare30d = revenue30d > 0 ? ((handling30d / revenue30d) * 100).toFixed(1) : "0.0";
@@ -633,6 +636,11 @@
               <div class="wt-dash-kpi-label">Handling Share (30d)</div>
               <div class="wt-dash-kpi-value">${handlingShare30d}%</div>
               <div class="wt-dash-kpi-sub">${dashboardCurrency} ${handling30d.toFixed(2)} handling total</div>
+            </div>
+            <div class="wt-dash-kpi-card">
+              <div class="wt-dash-kpi-label">Overdue A/R</div>
+              <div class="wt-dash-kpi-value">${dashboardCurrency} ${overdueAmount.toFixed(2)}</div>
+              <div class="wt-dash-kpi-sub">${overdueInvoices.length} overdue invoices (unpaid)</div>
             </div>
           </div>
 
@@ -1010,6 +1018,9 @@
       const outstanding = normalized
         .filter((r) => r.status !== "PAID")
         .reduce((sum, r) => sum + (Number(r.total) || 0), 0);
+      const overdue = normalized
+        .filter((r) => this._invoiceIsOverdue(r))
+        .reduce((sum, r) => sum + (Number(r.total) || 0), 0);
 
       return `
         <div class="space-y-5 fade-in">
@@ -1030,6 +1041,7 @@
             <div class="wt-kpi-chip"><span class="wt-kpi-label">Sent</span><span class="wt-kpi-value">${countSent}</span></div>
             <div class="wt-kpi-chip"><span class="wt-kpi-label">Paid</span><span class="wt-kpi-value">${countPaid}</span></div>
             <div class="wt-kpi-chip"><span class="wt-kpi-label">Outstanding</span><span class="wt-kpi-value">${invoiceCurrency} ${Number(outstanding).toFixed(2)}</span></div>
+            <div class="wt-kpi-chip"><span class="wt-kpi-label">Overdue</span><span class="wt-kpi-value">${invoiceCurrency} ${Number(overdue).toFixed(2)}</span></div>
           </div>
 
           <div class="flex flex-wrap gap-3 items-center">
@@ -1061,6 +1073,7 @@
                   <th class="wt-th-num">Handling</th>
                   <th class="wt-th-num">Total</th>
                   <th>Status</th>
+                  <th>Due</th>
                   <th>Created</th>
                   <th>Actions</th>
                 </tr>
@@ -1080,6 +1093,7 @@
                           <td class="wt-cell">
                             <span class="wt-status-badge wt-status-${String(r.status || "DRAFT").toLowerCase()}">${r.status || "DRAFT"}</span>
                           </td>
+                          <td class="wt-cell">${this._invoiceDueLabel(r)}</td>
                           <td class="wt-cell">${r.created_at ? new Date(r.created_at).toLocaleString() : ""}</td>
                           <td class="wt-cell">
                             <div class="wt-actions">
@@ -1093,7 +1107,7 @@
                       `).join("")
                     : `
                       <tr>
-                        <td class="wt-cell" colspan="10">
+                        <td class="wt-cell" colspan="11">
                           <div class="py-10 text-center text-slate-500">
                             <div class="text-4xl mb-2">🧾</div>
                             No invoices yet.
@@ -1250,6 +1264,12 @@
                   value="${this.invoiceForm.handling_fee_per_pallet || "0"}"
                   oninput="app.setInvoiceFormField('handling_fee_per_pallet', this.value)" />
               </div>
+              <div>
+                <label class="text-sm font-semibold text-slate-700">Payment terms (days)</label>
+                <input id="inv-payment-terms" type="number" min="0" max="365" step="1" class="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 text-sm"
+                  value="${this.invoiceForm.payment_terms_days || "7"}"
+                  oninput="app.setInvoiceFormField('payment_terms_days', this.value)" />
+              </div>
             </div>
 
             <div class="flex flex-wrap gap-2">
@@ -1279,6 +1299,8 @@
                     <div>Handled pallets: <span class="font-semibold">${preview.handled_pallets}</span></div>
                     <div>Base total: <span class="font-semibold">${preview.currency} ${preview.base_total}</span></div>
                     <div>Handling total: <span class="font-semibold">${preview.currency} ${preview.handling_total}</span></div>
+                    <div>Terms: <span class="font-semibold">${preview.payment_terms_days} days</span></div>
+                    <div>Due date: <span class="font-semibold">${preview.due_date || "—"}</span></div>
                     <div class="mt-2 text-base">Grand total: <span class="font-extrabold">${preview.currency} ${preview.total}</span></div>
                   </div>
                 `
@@ -1428,11 +1450,40 @@
       return "DRAFT";
     },
 
+    _parseYmdToUtcMs(ymd) {
+      const s = String(ymd || "").trim();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return NaN;
+      return Date.parse(`${s}T00:00:00Z`);
+    },
+
+    _invoiceIsOverdue(inv) {
+      const status = this._normalizedInvoiceStatus(inv?.status);
+      if (status === "PAID") return false;
+      const dueMs = this._parseYmdToUtcMs(inv?.due_date);
+      if (!Number.isFinite(dueMs)) return false;
+      const now = new Date();
+      const todayStartMs = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+      return dueMs < todayStartMs;
+    },
+
+    _invoiceDueLabel(inv) {
+      const due = String(inv?.due_date || "").trim();
+      if (!due) return "—";
+      if (!this._invoiceIsOverdue(inv)) return due;
+      const dueMs = this._parseYmdToUtcMs(due);
+      if (!Number.isFinite(dueMs)) return due;
+      const now = new Date();
+      const todayStartMs = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+      const days = Math.max(1, Math.floor((todayStartMs - dueMs) / (24 * 60 * 60 * 1000)));
+      return `${due} (${days}d overdue)`;
+    },
+
     ensureInvoiceFormDefaults() {
       const week = wtCurrentWeekRange();
       if (!this.invoiceForm.start_date) this.invoiceForm.start_date = week.start;
       if (!this.invoiceForm.end_date) this.invoiceForm.end_date = week.end;
       if (!this.invoiceForm.currency) this.invoiceForm.currency = "GBP";
+      if (!this.invoiceForm.payment_terms_days) this.invoiceForm.payment_terms_days = "7";
       if (this.invoiceForm.handling_fee_flat === "") this.invoiceForm.handling_fee_flat = "0";
       if (this.invoiceForm.handling_fee_per_pallet === "") this.invoiceForm.handling_fee_per_pallet = "0";
     },
@@ -1457,6 +1508,7 @@
         this.invoiceForm.rate_per_pallet_week = String(Number(match.rate_per_pallet_week || 0));
         this.invoiceForm.handling_fee_flat = String(Number(match.handling_fee_flat || 0));
         this.invoiceForm.handling_fee_per_pallet = String(Number(match.handling_fee_per_pallet || 0));
+        this.invoiceForm.payment_terms_days = String(Number(match.payment_terms_days ?? 7));
         this.invoiceForm.currency = String(match.currency || "GBP");
       }
       this.render();
@@ -1471,6 +1523,7 @@
       const ratePerWeekRaw = String(this.invoiceForm.rate_per_pallet_week || "").trim();
       const handlingFlatRaw = String(this.invoiceForm.handling_fee_flat || "").trim();
       const handlingPerPalletRaw = String(this.invoiceForm.handling_fee_per_pallet || "").trim();
+      const paymentTermsRaw = String(this.invoiceForm.payment_terms_days || "").trim();
       const currency = String(this.invoiceForm.currency || "GBP").trim() || "GBP";
 
       return {
@@ -1480,6 +1533,7 @@
         rate_per_pallet_week: ratePerWeekRaw === "" ? undefined : Number(ratePerWeekRaw),
         handling_fee_flat: handlingFlatRaw === "" ? undefined : Number(handlingFlatRaw),
         handling_fee_per_pallet: handlingPerPalletRaw === "" ? undefined : Number(handlingPerPalletRaw),
+        payment_terms_days: paymentTermsRaw === "" ? undefined : Number(paymentTermsRaw),
         currency,
       };
     },
@@ -1496,6 +1550,9 @@
       if (payload.handling_fee_per_pallet != null && (!Number.isFinite(payload.handling_fee_per_pallet) || payload.handling_fee_per_pallet < 0)) {
         return this.showToast("Enter a valid per-pallet handling fee", "error");
       }
+      if (!Number.isInteger(payload.payment_terms_days) || payload.payment_terms_days < 0 || payload.payment_terms_days > 365) {
+        return this.showToast("Payment terms must be 0-365 days", "error");
+      }
 
       await apiFetch("/api/rates", {
         method: "POST",
@@ -1504,6 +1561,7 @@
           rate_per_pallet_week: payload.rate_per_pallet_week,
           handling_fee_flat: payload.handling_fee_flat || 0,
           handling_fee_per_pallet: payload.handling_fee_per_pallet || 0,
+          payment_terms_days: payload.payment_terms_days,
           currency: payload.currency || "GBP",
         }),
       });
@@ -1590,6 +1648,8 @@
         ["base_total", Number(inv.base_total || 0).toFixed(2)],
         ["handling_total", Number(inv.handling_total || 0).toFixed(2)],
         ["total", Number(inv.total || 0).toFixed(2)],
+        ["payment_terms_days", Number(inv.payment_terms_days || 7)],
+        ["due_date", inv.due_date || ""],
         ["created_at", inv.created_at || ""],
         ["sent_at", inv.sent_at || ""],
         ["paid_at", inv.paid_at || ""],
