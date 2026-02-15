@@ -238,7 +238,7 @@ body{
 /* Dashboard */
 .wt-dash-kpi-grid{
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 12px;
 }
 .wt-dash-kpi-card{
@@ -474,6 +474,36 @@ body{
 .wt-btn-purple{ border-color: rgba(168,85,247,0.35); }
 .wt-btn-orange{ border-color: rgba(249,115,22,0.35); }
 .wt-btn-yellow{ border-color: rgba(234,179,8,0.35); }
+.wt-btn-green{ border-color: rgba(34,197,94,0.45); background: rgba(34,197,94,0.08); }
+.wt-btn-slate{ border-color: rgba(100,116,139,0.45); background: rgba(100,116,139,0.10); }
+
+.wt-status-badge{
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 66px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.03em;
+}
+.wt-status-draft{
+  color: #475569;
+  background: rgba(148,163,184,0.15);
+  border-color: rgba(148,163,184,0.35);
+}
+.wt-status-sent{
+  color: #1d4ed8;
+  background: rgba(59,130,246,0.12);
+  border-color: rgba(59,130,246,0.35);
+}
+.wt-status-paid{
+  color: #166534;
+  background: rgba(34,197,94,0.14);
+  border-color: rgba(34,197,94,0.4);
+}
 
 .wt-tracker-kpis{
   display: flex;

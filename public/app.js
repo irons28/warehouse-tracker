@@ -171,6 +171,7 @@
       currency: "GBP",
     },
     invoiceFilterCustomer: "",
+    invoiceFilterStatus: "",
 
     // --------------------------
     // UI: Toasts
@@ -541,6 +542,7 @@
     renderDashboard() {
       const pallets = Array.isArray(this.pallets) ? this.pallets : [];
       const activity = Array.isArray(this.activityLog) ? this.activityLog : [];
+      const invoices = Array.isArray(this.invoices) ? this.invoices : [];
 
       const totalRows = pallets.length;
       const totalPalletQty = pallets.reduce((sum, p) => sum + (Number(p.pallet_quantity) || 0), 0);
@@ -556,6 +558,25 @@
         return Number.isFinite(t) && (now - t) <= 24 * 60 * 60 * 1000;
       }).length;
 
+      const invoice30d = invoices.filter((i) => {
+        const t = Date.parse(i.created_at || "");
+        return Number.isFinite(t) && (now - t) <= 30 * 24 * 60 * 60 * 1000;
+      });
+      const revenue30d = invoice30d.reduce((sum, i) => sum + (Number(i.total) || 0), 0);
+      const handling30d = invoice30d.reduce((sum, i) => sum + (Number(i.handling_total) || 0), 0);
+      const handlingShare30d = revenue30d > 0 ? ((handling30d / revenue30d) * 100).toFixed(1) : "0.0";
+      const avgInvoice30d = invoice30d.length > 0 ? (revenue30d / invoice30d.length) : 0;
+
+      const invoiceByCustomer = Array.from(
+        invoices.reduce((map, inv) => {
+          const key = String(inv.customer_name || "Unassigned").trim() || "Unassigned";
+          map.set(key, (map.get(key) || 0) + (Number(inv.total) || 0));
+          return map;
+        }, new Map())
+      )
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 6);
+
       const topCustomers = Array.from(
         pallets.reduce((map, p) => {
           const key = String(p.customer_name || "Unassigned").trim() || "Unassigned";
@@ -568,6 +589,8 @@
         .slice(0, 6);
 
       const recent = activity.slice(0, 8);
+      const recentInvoices = invoices.slice(0, 8);
+      const dashboardCurrency = recentInvoices[0]?.currency || "GBP";
 
       return `
         <div class="space-y-5 fade-in">
@@ -575,7 +598,7 @@
             <div>
               <div class="text-sm font-semibold text-slate-600">Dashboard</div>
               <h2 class="mt-1 text-2xl font-extrabold text-slate-900">Operations Overview</h2>
-              <p class="mt-1 text-slate-600 text-sm">Real-time occupancy, inventory velocity, and customer mix.</p>
+              <p class="mt-1 text-slate-600 text-sm">Real-time occupancy, inventory velocity, customer mix, and billing pulse.</p>
             </div>
             <button class="rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800"
               onclick="app.refreshAll().catch(()=>{})">
@@ -601,6 +624,16 @@
               <div class="wt-dash-kpi-value">${utilization}%</div>
               <div class="wt-dash-kpi-sub">${occupied} / ${totalLocations} locations occupied</div>
             </div>
+            <div class="wt-dash-kpi-card">
+              <div class="wt-dash-kpi-label">Revenue (30d)</div>
+              <div class="wt-dash-kpi-value">${dashboardCurrency} ${revenue30d.toFixed(2)}</div>
+              <div class="wt-dash-kpi-sub">${invoice30d.length} invoices • avg ${dashboardCurrency} ${avgInvoice30d.toFixed(2)}</div>
+            </div>
+            <div class="wt-dash-kpi-card">
+              <div class="wt-dash-kpi-label">Handling Share (30d)</div>
+              <div class="wt-dash-kpi-value">${handlingShare30d}%</div>
+              <div class="wt-dash-kpi-sub">${dashboardCurrency} ${handling30d.toFixed(2)} handling total</div>
+            </div>
           </div>
 
           <div class="wt-dash-grid">
@@ -625,6 +658,25 @@
 
             <section class="wt-dash-panel">
               <div class="wt-dash-panel-head">
+                <div class="wt-dash-panel-title">Revenue by Customer</div>
+                <div class="wt-dash-panel-meta">${invoices.length} invoices total</div>
+              </div>
+              <div class="wt-dash-list">
+                ${
+                  invoiceByCustomer.length
+                    ? invoiceByCustomer.map(([name, total]) => `
+                        <div class="wt-dash-list-row">
+                          <span>${name}</span>
+                          <span class="wt-dash-list-value">${dashboardCurrency} ${Number(total).toFixed(2)}</span>
+                        </div>
+                      `).join("")
+                    : `<div class="text-slate-500 text-sm">No invoice totals yet.</div>`
+                }
+              </div>
+            </section>
+
+            <section class="wt-dash-panel">
+              <div class="wt-dash-panel-head">
                 <div class="wt-dash-panel-title">Activity Pulse</div>
                 <div class="wt-dash-panel-meta">${in24h} events in last 24h</div>
               </div>
@@ -641,6 +693,25 @@
                         `;
                       }).join("")
                     : `<div class="text-slate-500 text-sm">No activity yet.</div>`
+                }
+              </div>
+            </section>
+
+            <section class="wt-dash-panel">
+              <div class="wt-dash-panel-head">
+                <div class="wt-dash-panel-title">Recent Invoices</div>
+                <div class="wt-dash-panel-meta">Latest billing output</div>
+              </div>
+              <div class="wt-dash-list">
+                ${
+                  recentInvoices.length
+                    ? recentInvoices.map((inv) => `
+                        <div class="wt-dash-activity-row">
+                          <div class="wt-dash-activity-main">#${inv.id || "—"} • ${inv.customer_name || "Unknown"} • ${inv.currency || "GBP"} ${Number(inv.total || 0).toFixed(2)}</div>
+                          <div class="wt-dash-activity-sub">${inv.start_date || ""} → ${inv.end_date || ""} • ${inv.created_at ? new Date(inv.created_at).toLocaleString() : ""}</div>
+                        </div>
+                      `).join("")
+                    : `<div class="text-slate-500 text-sm">No invoices generated yet.</div>`
                 }
               </div>
             </section>
@@ -918,9 +989,27 @@
     renderInvoices() {
       const rows = Array.isArray(this.invoices) ? this.invoices.slice() : [];
       const filterCustomer = String(this.invoiceFilterCustomer || "").trim().toLowerCase();
-      const filtered = filterCustomer
-        ? rows.filter((r) => String(r.customer_name || "").toLowerCase().includes(filterCustomer))
-        : rows;
+      const filterStatus = String(this.invoiceFilterStatus || "").trim().toUpperCase();
+
+      const normalized = rows.map((r) => {
+        const rawStatus = String(r.status || "").trim().toUpperCase();
+        const status = rawStatus === "PAID" ? "PAID" : (rawStatus === "SENT" ? "SENT" : "DRAFT");
+        return { ...r, status };
+      });
+
+      const filtered = normalized.filter((r) => {
+        if (filterCustomer && !String(r.customer_name || "").toLowerCase().includes(filterCustomer)) return false;
+        if (filterStatus && r.status !== filterStatus) return false;
+        return true;
+      });
+
+      const countDraft = normalized.filter((r) => r.status === "DRAFT").length;
+      const countSent = normalized.filter((r) => r.status === "SENT").length;
+      const countPaid = normalized.filter((r) => r.status === "PAID").length;
+      const invoiceCurrency = normalized[0]?.currency || "GBP";
+      const outstanding = normalized
+        .filter((r) => r.status !== "PAID")
+        .reduce((sum, r) => sum + (Number(r.total) || 0), 0);
 
       return `
         <div class="space-y-5 fade-in">
@@ -936,12 +1025,28 @@
             </button>
           </div>
 
+          <div class="wt-tracker-kpis">
+            <div class="wt-kpi-chip"><span class="wt-kpi-label">Draft</span><span class="wt-kpi-value">${countDraft}</span></div>
+            <div class="wt-kpi-chip"><span class="wt-kpi-label">Sent</span><span class="wt-kpi-value">${countSent}</span></div>
+            <div class="wt-kpi-chip"><span class="wt-kpi-label">Paid</span><span class="wt-kpi-value">${countPaid}</span></div>
+            <div class="wt-kpi-chip"><span class="wt-kpi-label">Outstanding</span><span class="wt-kpi-value">${invoiceCurrency} ${Number(outstanding).toFixed(2)}</span></div>
+          </div>
+
           <div class="flex flex-wrap gap-3 items-center">
             <input type="text"
               value="${this.invoiceFilterCustomer || ""}"
               oninput="app.invoiceFilterCustomer=this.value;app.render();"
               placeholder="Filter by customer..."
               class="min-w-[240px] flex-1 rounded-xl border border-slate-300 px-3 py-2 text-sm" />
+            <select
+              class="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm"
+              onchange="app.invoiceFilterStatus=this.value;app.render();"
+            >
+              <option value="" ${this.invoiceFilterStatus ? "" : "selected"}>All statuses</option>
+              <option value="DRAFT" ${this.invoiceFilterStatus === "DRAFT" ? "selected" : ""}>Draft</option>
+              <option value="SENT" ${this.invoiceFilterStatus === "SENT" ? "selected" : ""}>Sent</option>
+              <option value="PAID" ${this.invoiceFilterStatus === "PAID" ? "selected" : ""}>Paid</option>
+            </select>
           </div>
 
           <div class="wt-table-wrap">
@@ -955,7 +1060,9 @@
                   <th class="wt-th-num">Rate/Week</th>
                   <th class="wt-th-num">Handling</th>
                   <th class="wt-th-num">Total</th>
+                  <th>Status</th>
                   <th>Created</th>
+                  <th>Actions</th>
                 </tr>
               </thead>
               <tbody>
@@ -970,12 +1077,23 @@
                           <td class="wt-cell wt-num">${r.currency || "GBP"} ${Number(r.rate_per_pallet_week || 0).toFixed(2)}</td>
                           <td class="wt-cell wt-num">${r.currency || "GBP"} ${Number(r.handling_total || 0).toFixed(2)}</td>
                           <td class="wt-cell wt-num wt-strong">${r.currency || "GBP"} ${Number(r.total || 0).toFixed(2)}</td>
+                          <td class="wt-cell">
+                            <span class="wt-status-badge wt-status-${String(r.status || "DRAFT").toLowerCase()}">${r.status || "DRAFT"}</span>
+                          </td>
                           <td class="wt-cell">${r.created_at ? new Date(r.created_at).toLocaleString() : ""}</td>
+                          <td class="wt-cell">
+                            <div class="wt-actions">
+                              ${r.status !== "SENT" ? `<button class="wt-btn wt-btn-blue" onclick="app.setInvoiceStatus(${Number(r.id)}, 'SENT')">Mark Sent</button>` : ""}
+                              ${r.status !== "PAID" ? `<button class="wt-btn wt-btn-green" onclick="app.setInvoiceStatus(${Number(r.id)}, 'PAID')">Mark Paid</button>` : ""}
+                              ${r.status !== "DRAFT" ? `<button class="wt-btn wt-btn-slate" onclick="app.setInvoiceStatus(${Number(r.id)}, 'DRAFT')">Set Draft</button>` : ""}
+                              <button class="wt-btn wt-btn-purple" onclick="app.exportInvoiceCsv(${Number(r.id)})">CSV</button>
+                            </div>
+                          </td>
                         </tr>
                       `).join("")
                     : `
                       <tr>
-                        <td class="wt-cell" colspan="8">
+                        <td class="wt-cell" colspan="10">
                           <div class="py-10 text-center text-slate-500">
                             <div class="text-4xl mb-2">🧾</div>
                             No invoices yet.
@@ -1303,6 +1421,13 @@
       }
     },
 
+    _normalizedInvoiceStatus(status) {
+      const s = String(status || "").trim().toUpperCase();
+      if (s === "PAID") return "PAID";
+      if (s === "SENT") return "SENT";
+      return "DRAFT";
+    },
+
     ensureInvoiceFormDefaults() {
       const week = wtCurrentWeekRange();
       if (!this.invoiceForm.start_date) this.invoiceForm.start_date = week.start;
@@ -1419,6 +1544,70 @@
       this.invoicePreview = generated;
       this.showToast(`Invoice #${generated.invoice_id} created`, "success");
       this.render();
+    },
+
+    async setInvoiceStatus(invoiceId, status) {
+      const id = Number(invoiceId);
+      if (!Number.isInteger(id) || id <= 0) return;
+      const nextStatus = this._normalizedInvoiceStatus(status);
+
+      await apiFetch(`/api/invoices/${id}/status`, {
+        method: "POST",
+        body: JSON.stringify({ status: nextStatus }),
+      });
+
+      await this.loadInvoices();
+      this.showToast(`Invoice #${id} set to ${nextStatus}`, "success");
+      this.render();
+    },
+
+    exportInvoiceCsv(invoiceId) {
+      const id = Number(invoiceId);
+      const inv = (this.invoices || []).find((r) => Number(r.id) === id);
+      if (!inv) {
+        this.showToast("Invoice not found", "error");
+        return;
+      }
+
+      let details = {};
+      try {
+        details = inv.details_json ? JSON.parse(inv.details_json) : {};
+      } catch {
+        details = {};
+      }
+
+      const rows = [
+        ["invoice_id", inv.id],
+        ["status", this._normalizedInvoiceStatus(inv.status)],
+        ["customer_name", inv.customer_name || ""],
+        ["start_date", inv.start_date || ""],
+        ["end_date", inv.end_date || ""],
+        ["currency", inv.currency || "GBP"],
+        ["pallet_days", Number(inv.pallet_days || 0)],
+        ["pallet_weeks", Number(details.pallet_weeks || (Number(inv.pallet_days || 0) / 7)).toFixed(4)],
+        ["handled_pallets", Number(inv.handled_pallets || details.handled_pallets || 0)],
+        ["rate_per_pallet_week", Number(inv.rate_per_pallet_week || 0).toFixed(2)],
+        ["base_total", Number(inv.base_total || 0).toFixed(2)],
+        ["handling_total", Number(inv.handling_total || 0).toFixed(2)],
+        ["total", Number(inv.total || 0).toFixed(2)],
+        ["created_at", inv.created_at || ""],
+        ["sent_at", inv.sent_at || ""],
+        ["paid_at", inv.paid_at || ""],
+      ];
+
+      const csv = rows
+        .map(([k, v]) => `${JSON.stringify(String(k))},${JSON.stringify(String(v ?? ""))}`)
+        .join("\n");
+      const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `invoice-${inv.id || "export"}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      this.showToast(`Invoice #${inv.id} exported`, "success");
     },
 
     search(term) {

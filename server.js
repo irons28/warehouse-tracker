@@ -887,6 +887,9 @@ db.serialize(() => {
     if (!has("handling_total")) db.run("ALTER TABLE invoices ADD COLUMN handling_total REAL NOT NULL DEFAULT 0");
     if (!has("currency")) db.run("ALTER TABLE invoices ADD COLUMN currency TEXT NOT NULL DEFAULT 'GBP'");
     if (!has("details_json")) db.run("ALTER TABLE invoices ADD COLUMN details_json TEXT");
+    if (!has("status")) db.run("ALTER TABLE invoices ADD COLUMN status TEXT NOT NULL DEFAULT 'DRAFT'");
+    if (!has("sent_at")) db.run("ALTER TABLE invoices ADD COLUMN sent_at TEXT");
+    if (!has("paid_at")) db.run("ALTER TABLE invoices ADD COLUMN paid_at TEXT");
   });
 });
 
@@ -1152,8 +1155,8 @@ app.post("/api/invoices/generate", (req, res) => {
           customer_name, start_date, end_date, billing_cycle, pallet_days,
           rate_per_pallet_day, rate_per_pallet_week,
           handling_fee_flat, handling_fee_per_pallet, handled_pallets,
-          base_total, handling_total, total, currency, details_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          base_total, handling_total, total, currency, details_json, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         preview.customer_name,
         preview.start_date,
@@ -1170,6 +1173,7 @@ app.post("/api/invoices/generate", (req, res) => {
         preview.total,
         preview.currency || "GBP",
         detailsJson,
+        "DRAFT",
       ],
       function insertInvoice(err) {
         if (err) return res.status(500).json({ error: "DB error" });
@@ -1181,6 +1185,41 @@ app.post("/api/invoices/generate", (req, res) => {
       }
     );
   });
+});
+
+app.post("/api/invoices/:id/status", (req, res) => {
+  const id = Number(req.params.id);
+  const status = String(req.body?.status || "").trim().toUpperCase();
+  const allowed = new Set(["DRAFT", "SENT", "PAID"]);
+
+  if (!Number.isInteger(id) || id <= 0) {
+    return res.status(400).json({ error: "Invalid invoice id" });
+  }
+  if (!allowed.has(status)) {
+    return res.status(400).json({ error: "status must be one of DRAFT, SENT, PAID" });
+  }
+
+  const nowIso = new Date().toISOString();
+  let sentAt = null;
+  let paidAt = null;
+  if (status === "SENT") sentAt = nowIso;
+  if (status === "PAID") paidAt = nowIso;
+
+  db.run(
+    `UPDATE invoices
+     SET status = ?, sent_at = ?, paid_at = ?
+     WHERE id = ?`,
+    [status, sentAt, paidAt, id],
+    function onStatusUpdated(err) {
+      if (err) return res.status(500).json({ error: "DB error" });
+      if (this.changes === 0) return res.status(404).json({ error: "Invoice not found" });
+
+      db.get("SELECT * FROM invoices WHERE id = ?", [id], (err2, row) => {
+        if (err2) return res.status(500).json({ error: "DB error" });
+        return res.json({ ok: true, invoice: row });
+      });
+    }
+  );
 });
 
 // Local IP helper
