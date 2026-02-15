@@ -235,6 +235,106 @@ body{
   margin: 0 auto;
 }
 
+/* Dashboard */
+.wt-dash-kpi-grid{
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+.wt-dash-kpi-card{
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 16px;
+  background: linear-gradient(180deg, rgba(255,255,255,0.98), rgba(248,250,252,0.95));
+  box-shadow: 0 10px 24px rgba(2,6,23,0.08);
+}
+.wt-dash-kpi-label{
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.wt-dash-kpi-value{
+  margin-top: 8px;
+  font-size: 30px;
+  line-height: 1.1;
+  font-weight: 900;
+  color: var(--text);
+}
+.wt-dash-kpi-sub{
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.wt-dash-grid{
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.wt-dash-panel{
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: #fff;
+  box-shadow: 0 10px 24px rgba(2,6,23,0.08);
+  overflow: hidden;
+}
+.wt-dash-panel-head{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+  background: #f8fafc;
+}
+.wt-dash-panel-title{
+  font-size: 14px;
+  font-weight: 900;
+  color: var(--text);
+}
+.wt-dash-panel-meta{
+  font-size: 12px;
+  color: var(--muted);
+  font-weight: 700;
+}
+.wt-dash-list{
+  padding: 8px 12px 12px;
+}
+.wt-dash-list-row{
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 8px;
+  border-bottom: 1px solid rgba(15,23,42,0.06);
+  font-size: 14px;
+}
+.wt-dash-list-row:last-child{
+  border-bottom: none;
+}
+.wt-dash-list-value{
+  font-variant-numeric: tabular-nums;
+  font-weight: 900;
+}
+.wt-dash-activity-row{
+  padding: 10px 8px;
+  border-bottom: 1px solid rgba(15,23,42,0.06);
+}
+.wt-dash-activity-row:last-child{
+  border-bottom: none;
+}
+.wt-dash-activity-main{
+  font-size: 13px;
+  font-weight: 800;
+  color: var(--text);
+}
+.wt-dash-activity-sub{
+  margin-top: 3px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
 /* Mobile drawer */
 .wt-backdrop{
   display:none;
@@ -269,12 +369,19 @@ body{
     pointer-events: auto;
   }
   .wt-main-inner{ padding: 18px 14px; }
+  .wt-dash-kpi-grid{
+    grid-template-columns: 1fr 1fr;
+  }
+  .wt-dash-grid{
+    grid-template-columns: 1fr;
+  }
 }
 
 /* Table styling used by tracker */
 .wt-table-wrap{
   width: 100%;
   overflow:auto;
+  max-height: calc(100vh - 260px);
   border-radius: var(--radius);
   background: #fff;
   border: 1px solid var(--border);
@@ -283,7 +390,7 @@ body{
 .wt-table{
   width: 100%;
   border-collapse: collapse;
-  min-width: 980px;
+  min-width: 1180px;
 }
 .wt-table thead th{
   position: sticky;
@@ -296,6 +403,7 @@ body{
   font-weight: 900;
   color: #0f172a;
   z-index: 2;
+  white-space: nowrap;
 }
 .wt-row td{
   border-top: 1px solid rgba(15,23,42,0.06);
@@ -308,17 +416,57 @@ body{
 .wt-cell.wt-num{ text-align: right; font-variant-numeric: tabular-nums; }
 .wt-th-num{ text-align: right; }
 
+.wt-density-compact .wt-row td{
+  padding: 8px 10px;
+  font-size: 13px;
+}
+.wt-density-comfy .wt-row td{
+  padding: 12px 12px;
+  font-size: 14px;
+}
+
+.wt-th-sticky-left{
+  left: 0;
+  z-index: 4 !important;
+  box-shadow: 1px 0 0 rgba(15,23,42,0.08);
+}
+.wt-td-sticky-left{
+  position: sticky;
+  left: 0;
+  background: #fff;
+  z-index: 1;
+  box-shadow: 1px 0 0 rgba(15,23,42,0.08);
+}
+.wt-th-sticky-right{
+  right: 0;
+  z-index: 4 !important;
+  box-shadow: -1px 0 0 rgba(15,23,42,0.08);
+}
+.wt-td-sticky-right{
+  position: sticky;
+  right: 0;
+  background: #fff;
+  z-index: 1;
+  box-shadow: -1px 0 0 rgba(15,23,42,0.08);
+}
+.wt-row:hover .wt-td-sticky-left,
+.wt-row:hover .wt-td-sticky-right{
+  background: #fafcff;
+}
+
 .wt-actions{
   display:flex;
-  flex-wrap: wrap;
-  gap: 8px;
+  flex-wrap: nowrap;
+  gap: 6px;
 }
 .wt-btn{
   border: 1px solid rgba(15,23,42,0.10);
   background: #fff;
-  padding: 8px 10px;
+  padding: 7px 9px;
   border-radius: 12px;
-  font-weight: 900;
+  font-weight: 800;
+  font-size: 12px;
+  white-space: nowrap;
   cursor:pointer;
 }
 .wt-btn:active{ transform: translateY(1px); }
@@ -326,6 +474,38 @@ body{
 .wt-btn-purple{ border-color: rgba(168,85,247,0.35); }
 .wt-btn-orange{ border-color: rgba(249,115,22,0.35); }
 .wt-btn-yellow{ border-color: rgba(234,179,8,0.35); }
+
+.wt-tracker-kpis{
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.wt-kpi-chip{
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: #fff;
+  box-shadow: 0 4px 12px rgba(2,6,23,0.05);
+}
+.wt-kpi-label{
+  font-size: 12px;
+  color: var(--muted);
+  font-weight: 700;
+}
+.wt-kpi-value{
+  font-size: 13px;
+  font-weight: 900;
+  color: var(--text);
+}
+
+@media (max-width: 980px){
+  .wt-table-wrap{
+    max-height: none;
+  }
+}
 
 /* =========================
    Warehouse Tracker Modals

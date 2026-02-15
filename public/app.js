@@ -56,6 +56,7 @@
           customer: String(obj.c || ""),
           productId: String(obj.p || ""),
           unitsPerPallet: Number(obj.u || 0) || 0,
+          hasUnitsPerPallet: Object.prototype.hasOwnProperty.call(obj, "u"),
           _format: "wt-v1",
         };
       } catch {
@@ -111,7 +112,7 @@
   // --------------------------
   const app = {
     // state
-    view: "scan",
+    view: "dashboard",
     sidebarOpen: false,
 
     pallets: [],
@@ -126,6 +127,9 @@
     scanMode: null,            // 'checkin-pallet' | 'checkin-location' | 'checkout' | 'checkout-units'
     _scannedPallet: null,      // holds pallet QR payload between scans
     scanner: null,
+    _scanBusy: false,
+    _lastScanText: "",
+    _lastScanAt: 0,
 
     // QR views
     tempPallet: null,          // used for single QR view
@@ -139,6 +143,7 @@
     // ui
     lastUpdatedAt: "",
     loading: false,
+    trackerDensity: "comfy", // "comfy" | "compact"
 
     // --------------------------
     // UI: Toasts
@@ -328,6 +333,21 @@
       this.render();
     },
 
+    setTrackerDensity(mode) {
+      const next = mode === "compact" ? "compact" : "comfy";
+      this.trackerDensity = next;
+      try {
+        localStorage.setItem("wt_tracker_density", next);
+      } catch {
+        // ignore
+      }
+      this.render();
+    },
+
+    toggleTrackerDensity() {
+      this.setTrackerDensity(this.trackerDensity === "compact" ? "comfy" : "compact");
+    },
+
     renderShell(contentHtml) {
       const sidebarOpen = !!this.sidebarOpen;
 
@@ -357,6 +377,7 @@
           <div class="wt-body">
             <aside class="wt-sidebar" aria-label="Navigation">
               <div class="wt-sidebar-inner">
+                <button class="wt-nav-btn" data-nav="dashboard" onclick="app.setView('dashboard')">Dashboard</button>
                 <button class="wt-nav-btn" data-nav="scan" onclick="app.setView('scan')">Scan</button>
                 <button class="wt-nav-btn" data-nav="tracker" onclick="app.setView('tracker')">Tracker</button>
                 <button class="wt-nav-btn" data-nav="history" onclick="app.setView('history')">History</button>
@@ -403,6 +424,7 @@
       }
 
       const content =
+        this.view === "dashboard" ? this.renderDashboard() :
         this.view === "scan" ? this.renderScan() :
         this.view === "tracker" ? this.renderTracker() :
         this.view === "history" ? this.renderHistory() :
@@ -487,6 +509,117 @@
     // --------------------------
     // Views
     // --------------------------
+    renderDashboard() {
+      const pallets = Array.isArray(this.pallets) ? this.pallets : [];
+      const activity = Array.isArray(this.activityLog) ? this.activityLog : [];
+
+      const totalRows = pallets.length;
+      const totalPalletQty = pallets.reduce((sum, p) => sum + (Number(p.pallet_quantity) || 0), 0);
+      const totalUnits = pallets.reduce((sum, p) => sum + (Number(p.current_units) || 0), 0);
+      const occupied = Number(this.stats?.occupied_locations || 0);
+      const totalLocations = Number(this.stats?.total_locations || 0);
+      const utilization = totalLocations > 0 ? ((occupied / totalLocations) * 100).toFixed(1) : "0.0";
+      const customers = new Set(pallets.map((p) => String(p.customer_name || "").trim()).filter(Boolean));
+
+      const now = Date.now();
+      const in24h = activity.filter((a) => {
+        const t = Date.parse(a.timestamp || "");
+        return Number.isFinite(t) && (now - t) <= 24 * 60 * 60 * 1000;
+      }).length;
+
+      const topCustomers = Array.from(
+        pallets.reduce((map, p) => {
+          const key = String(p.customer_name || "Unassigned").trim() || "Unassigned";
+          const next = (map.get(key) || 0) + (Number(p.pallet_quantity) || 0);
+          map.set(key, next);
+          return map;
+        }, new Map())
+      )
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 6);
+
+      const recent = activity.slice(0, 8);
+
+      return `
+        <div class="space-y-5 fade-in">
+          <div class="flex flex-wrap items-end justify-between gap-3">
+            <div>
+              <div class="text-sm font-semibold text-slate-600">Dashboard</div>
+              <h2 class="mt-1 text-2xl font-extrabold text-slate-900">Operations Overview</h2>
+              <p class="mt-1 text-slate-600 text-sm">Real-time occupancy, inventory velocity, and customer mix.</p>
+            </div>
+            <button class="rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800"
+              onclick="app.refreshAll().catch(()=>{})">
+              Refresh
+            </button>
+          </div>
+
+          <div class="wt-dash-kpi-grid">
+            <div class="wt-dash-kpi-card">
+              <div class="wt-dash-kpi-label">Active Records</div>
+              <div class="wt-dash-kpi-value">${totalRows}</div>
+            </div>
+            <div class="wt-dash-kpi-card">
+              <div class="wt-dash-kpi-label">Pallet Quantity</div>
+              <div class="wt-dash-kpi-value">${totalPalletQty}</div>
+            </div>
+            <div class="wt-dash-kpi-card">
+              <div class="wt-dash-kpi-label">Total Units</div>
+              <div class="wt-dash-kpi-value">${totalUnits}</div>
+            </div>
+            <div class="wt-dash-kpi-card">
+              <div class="wt-dash-kpi-label">Space Utilization</div>
+              <div class="wt-dash-kpi-value">${utilization}%</div>
+              <div class="wt-dash-kpi-sub">${occupied} / ${totalLocations} locations occupied</div>
+            </div>
+          </div>
+
+          <div class="wt-dash-grid">
+            <section class="wt-dash-panel">
+              <div class="wt-dash-panel-head">
+                <div class="wt-dash-panel-title">Customer Mix</div>
+                <div class="wt-dash-panel-meta">${customers.size} active customers</div>
+              </div>
+              <div class="wt-dash-list">
+                ${
+                  topCustomers.length
+                    ? topCustomers.map(([name, qty]) => `
+                        <div class="wt-dash-list-row">
+                          <span>${name}</span>
+                          <span class="wt-dash-list-value">${qty}</span>
+                        </div>
+                      `).join("")
+                    : `<div class="text-slate-500 text-sm">No customer data yet.</div>`
+                }
+              </div>
+            </section>
+
+            <section class="wt-dash-panel">
+              <div class="wt-dash-panel-head">
+                <div class="wt-dash-panel-title">Activity Pulse</div>
+                <div class="wt-dash-panel-meta">${in24h} events in last 24h</div>
+              </div>
+              <div class="wt-dash-list">
+                ${
+                  recent.length
+                    ? recent.map((a) => {
+                        const ts = a.timestamp ? new Date(a.timestamp).toLocaleString() : "";
+                        return `
+                          <div class="wt-dash-activity-row">
+                            <div class="wt-dash-activity-main">${a.action || "EVENT"} • ${a.product_id || "N/A"}</div>
+                            <div class="wt-dash-activity-sub">${a.customer_name || "Unknown"} • ${a.location || "N/A"} • ${ts}</div>
+                          </div>
+                        `;
+                      }).join("")
+                    : `<div class="text-slate-500 text-sm">No activity yet.</div>`
+                }
+              </div>
+            </section>
+          </div>
+        </div>
+      `;
+    },
+
     renderScan() {
       return `
         <div class="fade-in">
@@ -639,6 +772,9 @@
         });
       }
 
+      const totalPallets = pallets.reduce((sum, p) => sum + (Number(p.pallet_quantity) || 0), 0);
+      const totalUnits = pallets.reduce((sum, p) => sum + (Number(p.current_units) || 0), 0);
+
       return `
         <div class="space-y-5 fade-in">
           <div class="flex flex-wrap items-end justify-between gap-3">
@@ -647,10 +783,31 @@
               <h2 class="mt-1 text-2xl font-extrabold text-slate-900">Inventory</h2>
               <p class="mt-1 text-slate-600 text-sm">All pallets currently stored.</p>
             </div>
-            <button class="rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800"
-              onclick="app.refreshAll().catch(()=>{})">
-              Refresh
-            </button>
+            <div class="flex gap-2">
+              <button class="rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-900 hover:bg-slate-50"
+                onclick="app.toggleTrackerDensity()">
+                ${this.trackerDensity === "compact" ? "Comfy rows" : "Compact rows"}
+              </button>
+              <button class="rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800"
+                onclick="app.refreshAll().catch(()=>{})">
+                Refresh
+              </button>
+            </div>
+          </div>
+
+          <div class="wt-tracker-kpis">
+            <div class="wt-kpi-chip">
+              <span class="wt-kpi-label">Rows</span>
+              <span class="wt-kpi-value">${pallets.length}</span>
+            </div>
+            <div class="wt-kpi-chip">
+              <span class="wt-kpi-label">Pallet Qty</span>
+              <span class="wt-kpi-value">${totalPallets}</span>
+            </div>
+            <div class="wt-kpi-chip">
+              <span class="wt-kpi-label">Units</span>
+              <span class="wt-kpi-value">${totalUnits}</span>
+            </div>
           </div>
 
           <div class="flex flex-wrap gap-3 items-center">
@@ -671,9 +828,10 @@
           </div>
 
           <div class="wt-table-wrap">
-            <table class="wt-table">
+            <table class="wt-table ${this.trackerDensity === "compact" ? "wt-density-compact" : "wt-density-comfy"}">
               <thead>
                 <tr>
+                  <th class="wt-th-sticky-left">Pallet ID</th>
                   <th>Product</th>
                   <th>Customer</th>
                   <th>Location</th>
@@ -681,7 +839,7 @@
                   <th class="wt-th-num">Units/Pallet</th>
                   <th class="wt-th-num">Total Units</th>
                   <th>Added</th>
-                  <th>Actions</th>
+                  <th class="wt-th-sticky-right">Actions</th>
                 </tr>
               </thead>
               <tbody>
@@ -694,6 +852,7 @@
                         const added = p.date_added ? new Date(p.date_added).toLocaleDateString() : "";
                         return `
                           <tr class="wt-row">
+                            <td class="wt-cell wt-strong wt-td-sticky-left">${p.id || ""}</td>
                             <td class="wt-cell wt-strong">${p.product_id || ""}</td>
                             <td class="wt-cell">${p.customer_name || ""}</td>
                             <td class="wt-cell">${p.location || ""}</td>
@@ -701,7 +860,7 @@
                             <td class="wt-cell wt-num">${up || ""}</td>
                             <td class="wt-cell wt-num">${total}</td>
                             <td class="wt-cell">${added}</td>
-                            <td class="wt-cell wt-actions">
+                            <td class="wt-cell wt-actions wt-td-sticky-right">
                               <button class="wt-btn wt-btn-purple" onclick="app.reprintPalletQR('${p.id}')">Reprint</button>
                               ${up > 0 ? `<button class="wt-btn wt-btn-yellow" onclick="app.removePartialUnits('${p.id}')">Remove units</button>` : ""}
                               <button class="wt-btn wt-btn-blue" onclick="app.showProductInfo('${p.id}')">Info</button>
@@ -711,7 +870,7 @@
                       }).join("")
                     : `
                       <tr>
-                        <td class="wt-cell" colspan="8">
+                        <td class="wt-cell" colspan="9">
                           <div class="py-10 text-center text-slate-500">
                             <div class="text-4xl mb-2">📦</div>
                             No pallets found.
@@ -1115,8 +1274,13 @@ PART-ABC x 2"></textarea>
     // Scanner flow
     // --------------------------
     async startScanner(mode) {
+      await this.stopScanner(true);
+
       this.scanMode = mode;
       this._scannedPallet = null;
+      this._scanBusy = false;
+      this._lastScanText = "";
+      this._lastScanAt = 0;
       this.render();
 
       // Must exist globally: Html5Qrcode
@@ -1127,9 +1291,6 @@ PART-ABC x 2"></textarea>
 
       const el = document.getElementById("qr-reader");
       if (!el) return;
-
-      // stop existing
-      await this.stopScanner(true);
 
       this.scanner = new Html5Qrcode("qr-reader");
 
@@ -1149,6 +1310,8 @@ PART-ABC x 2"></textarea>
         );
       } catch (e) {
         this.showToast(`Camera start failed: ${e.message || e}`, "error");
+        this.scanMode = null;
+        this.render();
       }
     },
 
@@ -1165,16 +1328,29 @@ PART-ABC x 2"></textarea>
       } finally {
         this.scanMode = null;
         this._scannedPallet = null;
+        this._scanBusy = false;
+        this._lastScanText = "";
+        this._lastScanAt = 0;
         if (!silent) this.render();
       }
     },
 
     async _handleScan(text) {
-      if (!text) return;
+      const raw = String(text || "").trim();
+      if (!raw || this._scanBusy) return;
+
+      const now = Date.now();
+      if (this._lastScanText === raw && now - this._lastScanAt < 1200) return;
+
+      this._scanBusy = true;
+      this._lastScanText = raw;
+      this._lastScanAt = now;
+
+      try {
 
       // CHECK IN FLOW
       if (this.scanMode === "checkin-pallet") {
-        const payload = wtParsePalletQr(text);
+        const payload = wtParsePalletQr(raw);
         if (!payload?.id) {
           this.showToast("Invalid pallet QR", "error");
           return;
@@ -1189,7 +1365,7 @@ PART-ABC x 2"></textarea>
       }
 
       if (this.scanMode === "checkin-location") {
-        const loc = String(text).trim();
+        const loc = raw.toUpperCase();
         if (!loc) return;
 
         const pal = this._scannedPallet;
@@ -1198,6 +1374,15 @@ PART-ABC x 2"></textarea>
           return;
         }
 
+        const knownLocations = new Set((this.locations || []).map((x) => String(x.id || "").toUpperCase()).filter(Boolean));
+        if (knownLocations.size > 0 && !knownLocations.has(loc)) {
+          this.showToast(`Unknown location: ${loc}`, "error");
+          return;
+        }
+
+        // Stop camera before opening prompts to avoid duplicate scans.
+        await this.stopScanner(true);
+
         // If QR includes customer/product/units, use them. Otherwise prompt user.
         let customer = pal.customer || "";
         let productId = pal.productId || "";
@@ -1205,56 +1390,68 @@ PART-ABC x 2"></textarea>
 
         if (!customer) {
           const v = await this.prompt("Customer Name", "Customer name:");
-          if (v === null) return;
+          if (v === null) return this.setView("scan");
           customer = String(v).trim();
         }
         if (!productId) {
           const v = await this.prompt("Product ID", "Product ID:");
-          if (v === null) return;
+          if (v === null) return this.setView("scan");
           productId = String(v).trim();
         }
-        if (!unitsPerPallet) {
+        if (!pal.hasUnitsPerPallet) {
           const v = await this.prompt("Units per pallet (optional)", "Units per pallet (0 if not tracking):", "0");
-          if (v === null) return;
+          if (v === null) return this.setView("scan");
           unitsPerPallet = Number(v) || 0;
         }
 
         const palletQtyStr = await this.prompt("Pallet quantity", "How many pallets for this entry?", "1");
-        if (palletQtyStr === null) return;
+        if (palletQtyStr === null) return this.setView("scan");
         const palletQty = parseInt(palletQtyStr, 10) || 1;
 
-        await this.checkIn(customer, productId, palletQty, unitsPerPallet, loc, null);
-
-        await this.stopScanner(true);
+        await this.checkIn(customer, productId, palletQty, unitsPerPallet, loc, null, "Scan", pal.id);
         this.setView("tracker");
         return;
       }
 
       // CHECK OUT FLOW (whole entry)
       if (this.scanMode === "checkout") {
-        const payload = wtParsePalletQr(text);
+        const payload = wtParsePalletQr(raw);
         const id = payload?.id || String(text).trim();
         if (!id) return;
 
+        await this.stopScanner(true);
         const ok = await this.confirm("Check out pallet", `Remove pallet entry ${id} from inventory?`);
-        if (!ok) return;
+        if (!ok) return this.setView("scan");
 
         await this.checkOut(id);
-        await this.stopScanner(true);
         this.setView("tracker");
         return;
       }
 
       // REMOVE UNITS FLOW
       if (this.scanMode === "checkout-units") {
-        const payload = wtParsePalletQr(text);
+        const payload = wtParsePalletQr(raw);
         const id = payload?.id || String(text).trim();
         if (!id) return;
 
         await this.stopScanner(true);
-        await this.removePartialUnits(id);
+        const unitsStr = await this.prompt("Remove Units", `How many units to remove from ${id}?`, "1");
+        if (unitsStr === null) return this.setView("scan");
+
+        const unitsToRemove = Number(unitsStr);
+        if (!Number.isFinite(unitsToRemove) || unitsToRemove <= 0) {
+          this.showToast("Enter a valid unit quantity", "error");
+          return this.setView("scan");
+        }
+
+        await this.removePartialUnits(id, unitsToRemove, "Scan");
         this.setView("tracker");
         return;
+      }
+      } finally {
+        setTimeout(() => {
+          this._scanBusy = false;
+        }, 300);
       }
     },
 
@@ -1262,10 +1459,10 @@ PART-ABC x 2"></textarea>
     // Server mutations
     // --------------------------
 
-  async checkIn(customerName, productId, palletQuantity, productQuantity, location, parts = null, scannedBy = 'Manual entry') {
+  async checkIn(customerName, productId, palletQuantity, productQuantity, location, parts = null, scannedBy = 'Manual entry', palletId = null) {
     try {
       const payload = {
-        id: null, // server can generate if omitted; keep null for clarity
+        id: palletId || null, // server can generate if omitted
         customer_name: customerName,
         product_id: productId,
         pallet_quantity: palletQuantity,
@@ -1309,8 +1506,19 @@ PART-ABC x 2"></textarea>
     try {
       if (!palletId) throw new Error('Missing pallet id');
 
+      let finalUnits = Number(unitsToRemove);
+      if (!Number.isFinite(finalUnits) || finalUnits <= 0) {
+        const unitsStr = await this.prompt("Remove Units", `How many units to remove from ${palletId}?`, "1");
+        if (unitsStr === null) return;
+        finalUnits = Number(unitsStr);
+      }
+      if (!Number.isFinite(finalUnits) || finalUnits <= 0) {
+        this.showToast("Enter a valid unit quantity", "error");
+        return;
+      }
+
       const payload = {
-        units_to_remove: Number(unitsToRemove) || 0,
+        units_to_remove: finalUnits,
         scanned_by: scannedBy,
       };
 
@@ -1494,6 +1702,15 @@ PART-ABC x 2"></textarea>
     // --------------------------
     async init() {
       try {
+        try {
+          const savedDensity = localStorage.getItem("wt_tracker_density");
+          if (savedDensity === "compact" || savedDensity === "comfy") {
+            this.trackerDensity = savedDensity;
+          }
+        } catch {
+          // ignore
+        }
+
         await this.refreshAll();
       } catch {
         // ignore
