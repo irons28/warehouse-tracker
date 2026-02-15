@@ -68,6 +68,20 @@
     return { id: text.trim(), customer: "", productId: "", unitsPerPallet: 0, _format: "legacy" };
   }
 
+  function wtCurrentWeekRange() {
+    const now = new Date();
+    const utcDay = now.getUTCDay(); // 0=Sun
+    const daysFromMonday = (utcDay + 6) % 7;
+    const monday = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+    monday.setUTCDate(monday.getUTCDate() - daysFromMonday);
+    const sunday = new Date(monday);
+    sunday.setUTCDate(sunday.getUTCDate() + 6);
+    return {
+      start: monday.toISOString().slice(0, 10),
+      end: sunday.toISOString().slice(0, 10),
+    };
+  }
+
   // --------------------------
   // Safe fetch helpers
   // --------------------------
@@ -144,6 +158,19 @@
     lastUpdatedAt: "",
     loading: false,
     trackerDensity: "comfy", // "comfy" | "compact"
+    rates: [],
+    invoices: [],
+    invoicePreview: null,
+    invoiceForm: {
+      customer_name: "",
+      start_date: "",
+      end_date: "",
+      rate_per_pallet_week: "",
+      handling_fee_flat: "0",
+      handling_fee_per_pallet: "0",
+      currency: "GBP",
+    },
+    invoiceFilterCustomer: "",
 
     // --------------------------
     // UI: Toasts
@@ -380,6 +407,7 @@
                 <button class="wt-nav-btn" data-nav="dashboard" onclick="app.setView('dashboard')">Dashboard</button>
                 <button class="wt-nav-btn" data-nav="scan" onclick="app.setView('scan')">Scan</button>
                 <button class="wt-nav-btn" data-nav="tracker" onclick="app.setView('tracker')">Tracker</button>
+                <button class="wt-nav-btn" data-nav="invoices" onclick="app.setView('invoices')">Invoices</button>
                 <button class="wt-nav-btn" data-nav="history" onclick="app.setView('history')">History</button>
                 <button class="wt-nav-btn" data-nav="settings" onclick="app.setView('settings')">Settings</button>
 
@@ -427,6 +455,7 @@
         this.view === "dashboard" ? this.renderDashboard() :
         this.view === "scan" ? this.renderScan() :
         this.view === "tracker" ? this.renderTracker() :
+        this.view === "invoices" ? this.renderInvoices() :
         this.view === "history" ? this.renderHistory() :
         this.view === "settings" ? this.renderSettings() :
         this.view === "location-qrs" ? this.renderLocationQRs() :
@@ -886,6 +915,82 @@
       `;
     },
 
+    renderInvoices() {
+      const rows = Array.isArray(this.invoices) ? this.invoices.slice() : [];
+      const filterCustomer = String(this.invoiceFilterCustomer || "").trim().toLowerCase();
+      const filtered = filterCustomer
+        ? rows.filter((r) => String(r.customer_name || "").toLowerCase().includes(filterCustomer))
+        : rows;
+
+      return `
+        <div class="space-y-5 fade-in">
+          <div class="flex flex-wrap items-end justify-between gap-3">
+            <div>
+              <div class="text-sm font-semibold text-slate-600">Invoices</div>
+              <h2 class="mt-1 text-2xl font-extrabold text-slate-900">Billing History</h2>
+              <p class="mt-1 text-slate-600 text-sm">Generated weekly invoices and totals.</p>
+            </div>
+            <button class="rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800"
+              onclick="app.refreshAll().catch(()=>{})">
+              Refresh
+            </button>
+          </div>
+
+          <div class="flex flex-wrap gap-3 items-center">
+            <input type="text"
+              value="${this.invoiceFilterCustomer || ""}"
+              oninput="app.invoiceFilterCustomer=this.value;app.render();"
+              placeholder="Filter by customer..."
+              class="min-w-[240px] flex-1 rounded-xl border border-slate-300 px-3 py-2 text-sm" />
+          </div>
+
+          <div class="wt-table-wrap">
+            <table class="wt-table wt-density-compact">
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>Customer</th>
+                  <th>Range</th>
+                  <th class="wt-th-num">Pallet Days</th>
+                  <th class="wt-th-num">Rate/Week</th>
+                  <th class="wt-th-num">Handling</th>
+                  <th class="wt-th-num">Total</th>
+                  <th>Created</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${
+                  filtered.length
+                    ? filtered.map((r) => `
+                        <tr class="wt-row">
+                          <td class="wt-cell wt-strong">${r.id || ""}</td>
+                          <td class="wt-cell">${r.customer_name || ""}</td>
+                          <td class="wt-cell">${r.start_date || ""} → ${r.end_date || ""}</td>
+                          <td class="wt-cell wt-num">${Number(r.pallet_days || 0)}</td>
+                          <td class="wt-cell wt-num">${r.currency || "GBP"} ${Number(r.rate_per_pallet_week || 0).toFixed(2)}</td>
+                          <td class="wt-cell wt-num">${r.currency || "GBP"} ${Number(r.handling_total || 0).toFixed(2)}</td>
+                          <td class="wt-cell wt-num wt-strong">${r.currency || "GBP"} ${Number(r.total || 0).toFixed(2)}</td>
+                          <td class="wt-cell">${r.created_at ? new Date(r.created_at).toLocaleString() : ""}</td>
+                        </tr>
+                      `).join("")
+                    : `
+                      <tr>
+                        <td class="wt-cell" colspan="8">
+                          <div class="py-10 text-center text-slate-500">
+                            <div class="text-4xl mb-2">🧾</div>
+                            No invoices yet.
+                          </div>
+                        </td>
+                      </tr>
+                    `
+                }
+              </tbody>
+            </table>
+          </div>
+        </div>
+      `;
+    },
+
     renderHistory() {
       const logs = Array.isArray(this.activityLog) ? this.activityLog : [];
       return `
@@ -937,6 +1042,12 @@
 
     renderSettings() {
       const url = this.googleSheetsUrl || "";
+      this.ensureInvoiceFormDefaults();
+      const knownCustomers = Array.from(new Set([
+        ...(this.customers || []),
+        ...((this.rates || []).map((r) => r.customer_name).filter(Boolean)),
+      ])).sort();
+      const preview = this.invoicePreview;
       return `
         <div class="space-y-5 fade-in">
           <div>
@@ -966,6 +1077,95 @@
             <div class="mt-2 text-sm text-slate-600">
               If you’re testing updates, use a hard refresh and ensure you’re not serving an old cached app.js.
             </div>
+          </div>
+
+          <div class="rounded-2xl border border-slate-200 bg-white p-5 space-y-4">
+            <div>
+              <div class="font-bold text-slate-900">Invoicing Groundwork (Weekly)</div>
+              <div class="mt-1 text-sm text-slate-600">Per-customer weekly rate + handling fees (flat + per pallet handled).</div>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div>
+                <label class="text-sm font-semibold text-slate-700">Customer</label>
+                <input id="inv-customer" list="inv-customer-list" class="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 text-sm"
+                  value="${this.invoiceForm.customer_name || ""}"
+                  onchange="app.onInvoiceCustomerChange(this.value)"
+                  placeholder="e.g. COUNCIL" />
+                <datalist id="inv-customer-list">
+                  ${knownCustomers.map((c) => `<option value="${c}"></option>`).join("")}
+                </datalist>
+              </div>
+              <div>
+                <label class="text-sm font-semibold text-slate-700">Currency</label>
+                <input id="inv-currency" class="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 text-sm"
+                  value="${this.invoiceForm.currency || "GBP"}"
+                  oninput="app.setInvoiceFormField('currency', this.value)" />
+              </div>
+              <div>
+                <label class="text-sm font-semibold text-slate-700">Start date</label>
+                <input id="inv-start" type="date" class="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 text-sm"
+                  value="${this.invoiceForm.start_date || ""}"
+                  oninput="app.setInvoiceFormField('start_date', this.value)" />
+              </div>
+              <div>
+                <label class="text-sm font-semibold text-slate-700">End date</label>
+                <input id="inv-end" type="date" class="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 text-sm"
+                  value="${this.invoiceForm.end_date || ""}"
+                  oninput="app.setInvoiceFormField('end_date', this.value)" />
+              </div>
+              <div>
+                <label class="text-sm font-semibold text-slate-700">Rate / pallet / week</label>
+                <input id="inv-rate-week" type="number" min="0" step="0.01" class="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 text-sm"
+                  value="${this.invoiceForm.rate_per_pallet_week || ""}"
+                  oninput="app.setInvoiceFormField('rate_per_pallet_week', this.value)" />
+              </div>
+              <div>
+                <label class="text-sm font-semibold text-slate-700">Handling fee (flat)</label>
+                <input id="inv-handling-flat" type="number" min="0" step="0.01" class="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 text-sm"
+                  value="${this.invoiceForm.handling_fee_flat || "0"}"
+                  oninput="app.setInvoiceFormField('handling_fee_flat', this.value)" />
+              </div>
+              <div>
+                <label class="text-sm font-semibold text-slate-700">Handling fee (per pallet handled)</label>
+                <input id="inv-handling-pallet" type="number" min="0" step="0.01" class="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 text-sm"
+                  value="${this.invoiceForm.handling_fee_per_pallet || "0"}"
+                  oninput="app.setInvoiceFormField('handling_fee_per_pallet', this.value)" />
+              </div>
+            </div>
+
+            <div class="flex flex-wrap gap-2">
+              <button class="rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-900 hover:bg-slate-50"
+                onclick="app.saveCustomerRate().catch(e=>app.showToast(e.message || 'Save rate failed','error'))">
+                Save Customer Rate
+              </button>
+              <button class="rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-900 hover:bg-slate-50"
+                onclick="app.previewInvoice().catch(e=>app.showToast(e.message || 'Preview failed','error'))">
+                Preview Invoice
+              </button>
+              <button class="rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800"
+                onclick="app.generateInvoice().catch(e=>app.showToast(e.message || 'Generate failed','error'))">
+                Generate Invoice
+              </button>
+            </div>
+
+            ${
+              preview
+                ? `
+                  <div class="rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-700">
+                    <div class="font-bold text-slate-900 mb-2">Invoice Preview ${preview.invoice_id ? `#${preview.invoice_id}` : ""}</div>
+                    <div>Customer: <span class="font-semibold">${preview.customer_name}</span></div>
+                    <div>Range: <span class="font-semibold">${preview.start_date}</span> to <span class="font-semibold">${preview.end_date}</span></div>
+                    <div>Pallet days: <span class="font-semibold">${preview.pallet_days}</span></div>
+                    <div>Pallet weeks: <span class="font-semibold">${preview.pallet_weeks}</span></div>
+                    <div>Handled pallets: <span class="font-semibold">${preview.handled_pallets}</span></div>
+                    <div>Base total: <span class="font-semibold">${preview.currency} ${preview.base_total}</span></div>
+                    <div>Handling total: <span class="font-semibold">${preview.currency} ${preview.handling_total}</span></div>
+                    <div class="mt-2 text-base">Grand total: <span class="font-extrabold">${preview.currency} ${preview.total}</span></div>
+                  </div>
+                `
+                : ""
+            }
           </div>
         </div>
       `;
@@ -1034,12 +1234,15 @@
     // --------------------------
     async refreshAll() {
       try {
+        this.ensureInvoiceFormDefaults();
         await Promise.allSettled([
           this.loadPallets(),
           this.loadActivity(),
           this.loadLocations(),
           this.loadStats(),
           this.loadSettings(),
+          this.loadRates(),
+          this.loadInvoices(),
         ]);
         this.lastUpdatedAt = new Date().toLocaleTimeString();
         this._updateTopRightLastUpdated();
@@ -1080,6 +1283,142 @@
       } catch {
         // non-fatal
       }
+    },
+
+    async loadRates() {
+      try {
+        const data = await apiFetch(`/api/rates?_t=${Date.now()}`);
+        this.rates = Array.isArray(data) ? data : [];
+      } catch {
+        this.rates = [];
+      }
+    },
+
+    async loadInvoices() {
+      try {
+        const data = await apiFetch(`/api/invoices?_t=${Date.now()}`);
+        this.invoices = Array.isArray(data) ? data : [];
+      } catch {
+        this.invoices = [];
+      }
+    },
+
+    ensureInvoiceFormDefaults() {
+      const week = wtCurrentWeekRange();
+      if (!this.invoiceForm.start_date) this.invoiceForm.start_date = week.start;
+      if (!this.invoiceForm.end_date) this.invoiceForm.end_date = week.end;
+      if (!this.invoiceForm.currency) this.invoiceForm.currency = "GBP";
+      if (this.invoiceForm.handling_fee_flat === "") this.invoiceForm.handling_fee_flat = "0";
+      if (this.invoiceForm.handling_fee_per_pallet === "") this.invoiceForm.handling_fee_per_pallet = "0";
+    },
+
+    setInvoiceFormField(key, value) {
+      if (!this.invoiceForm || typeof this.invoiceForm !== "object") return;
+      this.invoiceForm[key] = String(value ?? "");
+    },
+
+    onInvoiceCustomerChange(value) {
+      const customerName = String(value || "").trim();
+      this.setInvoiceFormField("customer_name", customerName);
+      if (!customerName) {
+        this.render();
+        return;
+      }
+
+      const match = (this.rates || []).find(
+        (r) => String(r.customer_name || "").toLowerCase() === customerName.toLowerCase()
+      );
+      if (match) {
+        this.invoiceForm.rate_per_pallet_week = String(Number(match.rate_per_pallet_week || 0));
+        this.invoiceForm.handling_fee_flat = String(Number(match.handling_fee_flat || 0));
+        this.invoiceForm.handling_fee_per_pallet = String(Number(match.handling_fee_per_pallet || 0));
+        this.invoiceForm.currency = String(match.currency || "GBP");
+      }
+      this.render();
+    },
+
+    _readInvoiceInputs() {
+      this.ensureInvoiceFormDefaults();
+
+      const customerName = String(this.invoiceForm.customer_name || "").trim();
+      const startDate = String(this.invoiceForm.start_date || "").trim();
+      const endDate = String(this.invoiceForm.end_date || "").trim();
+      const ratePerWeekRaw = String(this.invoiceForm.rate_per_pallet_week || "").trim();
+      const handlingFlatRaw = String(this.invoiceForm.handling_fee_flat || "").trim();
+      const handlingPerPalletRaw = String(this.invoiceForm.handling_fee_per_pallet || "").trim();
+      const currency = String(this.invoiceForm.currency || "GBP").trim() || "GBP";
+
+      return {
+        customer_name: customerName,
+        start_date: startDate,
+        end_date: endDate,
+        rate_per_pallet_week: ratePerWeekRaw === "" ? undefined : Number(ratePerWeekRaw),
+        handling_fee_flat: handlingFlatRaw === "" ? undefined : Number(handlingFlatRaw),
+        handling_fee_per_pallet: handlingPerPalletRaw === "" ? undefined : Number(handlingPerPalletRaw),
+        currency,
+      };
+    },
+
+    async saveCustomerRate() {
+      const payload = this._readInvoiceInputs();
+      if (!payload.customer_name) return this.showToast("Customer is required", "error");
+      if (!Number.isFinite(payload.rate_per_pallet_week) || payload.rate_per_pallet_week < 0) {
+        return this.showToast("Enter a valid weekly rate", "error");
+      }
+      if (payload.handling_fee_flat != null && (!Number.isFinite(payload.handling_fee_flat) || payload.handling_fee_flat < 0)) {
+        return this.showToast("Enter a valid flat handling fee", "error");
+      }
+      if (payload.handling_fee_per_pallet != null && (!Number.isFinite(payload.handling_fee_per_pallet) || payload.handling_fee_per_pallet < 0)) {
+        return this.showToast("Enter a valid per-pallet handling fee", "error");
+      }
+
+      await apiFetch("/api/rates", {
+        method: "POST",
+        body: JSON.stringify({
+          customer_name: payload.customer_name,
+          rate_per_pallet_week: payload.rate_per_pallet_week,
+          handling_fee_flat: payload.handling_fee_flat || 0,
+          handling_fee_per_pallet: payload.handling_fee_per_pallet || 0,
+          currency: payload.currency || "GBP",
+        }),
+      });
+
+      this.showToast("Customer rate saved", "success");
+      await this.loadRates();
+      this.render();
+    },
+
+    async previewInvoice() {
+      const payload = this._readInvoiceInputs();
+      if (!payload.customer_name || !payload.start_date || !payload.end_date) {
+        return this.showToast("Customer + start/end dates are required", "error");
+      }
+
+      const preview = await apiFetch("/api/invoices/preview", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+
+      this.invoicePreview = preview;
+      this.showToast("Invoice preview updated", "success");
+      this.render();
+    },
+
+    async generateInvoice() {
+      const payload = this._readInvoiceInputs();
+      if (!payload.customer_name || !payload.start_date || !payload.end_date) {
+        return this.showToast("Customer + start/end dates are required", "error");
+      }
+
+      const generated = await apiFetch("/api/invoices/generate", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+
+      await this.loadInvoices();
+      this.invoicePreview = generated;
+      this.showToast(`Invoice #${generated.invoice_id} created`, "success");
+      this.render();
     },
 
     search(term) {
@@ -1702,6 +2041,7 @@ PART-ABC x 2"></textarea>
     // --------------------------
     async init() {
       try {
+        this.ensureInvoiceFormDefaults();
         try {
           const savedDensity = localStorage.getItem("wt_tracker_density");
           if (savedDensity === "compact" || savedDensity === "comfy") {

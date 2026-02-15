@@ -823,6 +823,366 @@ app.post("/api/sheets/sync", async (req, res) => {
   }
 });
 
+// -----------------------------
+// Invoicing (v2) - weekly billing with customer rates + handling fees
+// -----------------------------
+db.serialize(() => {
+  db.run(`CREATE TABLE IF NOT EXISTS customer_rates (
+    customer_name TEXT PRIMARY KEY,
+    rate_per_pallet_week REAL NOT NULL DEFAULT 0,
+    handling_fee_flat REAL NOT NULL DEFAULT 0,
+    handling_fee_per_pallet REAL NOT NULL DEFAULT 0,
+    currency TEXT NOT NULL DEFAULT 'GBP',
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`);
+
+  db.all("PRAGMA table_info(customer_rates)", (err, columns) => {
+    if (err || !columns) return;
+    const hasWeekRate = columns.some((c) => c.name === "rate_per_pallet_week");
+    const hasDayRate = columns.some((c) => c.name === "rate_per_pallet_day");
+    const hasHandlingFlat = columns.some((c) => c.name === "handling_fee_flat");
+    const hasHandlingPerPallet = columns.some((c) => c.name === "handling_fee_per_pallet");
+    const hasCurrency = columns.some((c) => c.name === "currency");
+
+    if (!hasWeekRate) {
+      db.run("ALTER TABLE customer_rates ADD COLUMN rate_per_pallet_week REAL NOT NULL DEFAULT 0");
+      if (hasDayRate) {
+        db.run("UPDATE customer_rates SET rate_per_pallet_week = rate_per_pallet_day * 7 WHERE rate_per_pallet_week = 0");
+      }
+    }
+    if (!hasHandlingFlat) db.run("ALTER TABLE customer_rates ADD COLUMN handling_fee_flat REAL NOT NULL DEFAULT 0");
+    if (!hasHandlingPerPallet) db.run("ALTER TABLE customer_rates ADD COLUMN handling_fee_per_pallet REAL NOT NULL DEFAULT 0");
+    if (!hasCurrency) db.run("ALTER TABLE customer_rates ADD COLUMN currency TEXT NOT NULL DEFAULT 'GBP'");
+  });
+
+  db.run(`CREATE TABLE IF NOT EXISTS invoices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    customer_name TEXT NOT NULL,
+    start_date TEXT NOT NULL,
+    end_date TEXT NOT NULL,
+    billing_cycle TEXT NOT NULL DEFAULT 'WEEKLY',
+    pallet_days INTEGER NOT NULL,
+    rate_per_pallet_day REAL NOT NULL DEFAULT 0,
+    rate_per_pallet_week REAL NOT NULL DEFAULT 0,
+    handling_fee_flat REAL NOT NULL DEFAULT 0,
+    handling_fee_per_pallet REAL NOT NULL DEFAULT 0,
+    handled_pallets INTEGER NOT NULL DEFAULT 0,
+    base_total REAL NOT NULL DEFAULT 0,
+    handling_total REAL NOT NULL DEFAULT 0,
+    total REAL NOT NULL,
+    currency TEXT NOT NULL DEFAULT 'GBP',
+    details_json TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`);
+
+  db.all("PRAGMA table_info(invoices)", (err, columns) => {
+    if (err || !columns) return;
+    const has = (name) => columns.some((c) => c.name === name);
+    if (!has("billing_cycle")) db.run("ALTER TABLE invoices ADD COLUMN billing_cycle TEXT NOT NULL DEFAULT 'WEEKLY'");
+    if (!has("rate_per_pallet_week")) db.run("ALTER TABLE invoices ADD COLUMN rate_per_pallet_week REAL NOT NULL DEFAULT 0");
+    if (!has("handling_fee_flat")) db.run("ALTER TABLE invoices ADD COLUMN handling_fee_flat REAL NOT NULL DEFAULT 0");
+    if (!has("handling_fee_per_pallet")) db.run("ALTER TABLE invoices ADD COLUMN handling_fee_per_pallet REAL NOT NULL DEFAULT 0");
+    if (!has("handled_pallets")) db.run("ALTER TABLE invoices ADD COLUMN handled_pallets INTEGER NOT NULL DEFAULT 0");
+    if (!has("base_total")) db.run("ALTER TABLE invoices ADD COLUMN base_total REAL NOT NULL DEFAULT 0");
+    if (!has("handling_total")) db.run("ALTER TABLE invoices ADD COLUMN handling_total REAL NOT NULL DEFAULT 0");
+    if (!has("currency")) db.run("ALTER TABLE invoices ADD COLUMN currency TEXT NOT NULL DEFAULT 'GBP'");
+    if (!has("details_json")) db.run("ALTER TABLE invoices ADD COLUMN details_json TEXT");
+  });
+});
+
+function parseYmdToUtcDate(ymd) {
+  const s = String(ymd || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+  const d = new Date(`${s}T00:00:00Z`);
+  return Number.isFinite(d.getTime()) ? d : null;
+}
+
+function formatYmdUtc(dateObj) {
+  return new Date(dateObj).toISOString().slice(0, 10);
+}
+
+function addDaysYmd(ymd, daysToAdd) {
+  const d = parseYmdToUtcDate(ymd);
+  if (!d) return null;
+  d.setUTCDate(d.getUTCDate() + daysToAdd);
+  return formatYmdUtc(d);
+}
+
+function endOfDayIso(d) {
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 23, 59, 59)).toISOString();
+}
+
+function calculateInvoiceMetrics(customerName, startDate, endDate, done) {
+  const start = parseYmdToUtcDate(startDate);
+  const end = parseYmdToUtcDate(endDate);
+  if (!start || !end || end < start) return done(new Error("Invalid date range"));
+
+  db.all(
+    `SELECT pallet_id, action, quantity_after, timestamp
+     FROM activity_log
+     WHERE customer_name = ?
+       AND datetime(timestamp) <= datetime(?)
+     ORDER BY datetime(timestamp) ASC`,
+    [customerName, `${endDate}T23:59:59Z`],
+    (err, rows) => {
+      if (err) return done(err);
+
+      const state = new Map();
+      let idx = 0;
+      const dayMs = 24 * 60 * 60 * 1000;
+      const days = Math.floor((end - start) / dayMs) + 1;
+      let palletDays = 0;
+
+      for (let di = 0; di < days; di++) {
+        const day = new Date(start.getTime() + di * dayMs);
+        const cutoff = endOfDayIso(day);
+
+        while (idx < rows.length && new Date(rows[idx].timestamp).toISOString() <= cutoff) {
+          const r = rows[idx];
+          const qty = Number(r.quantity_after) || 0;
+
+          if (r.action === "CHECK_IN") state.set(r.pallet_id, qty);
+          else if (r.action === "CHECK_OUT") state.delete(r.pallet_id);
+          else if (r.action === "PARTIAL_REMOVE") (qty > 0 ? state.set(r.pallet_id, qty) : state.delete(r.pallet_id));
+
+          idx++;
+        }
+
+        let occ = 0;
+        for (const q of state.values()) occ += (Number(q) || 0);
+        palletDays += occ;
+      }
+
+      db.get(
+        `SELECT COALESCE(SUM(quantity_changed), 0) AS handled
+         FROM activity_log
+         WHERE customer_name = ?
+           AND action = 'CHECK_IN'
+           AND datetime(timestamp) >= datetime(?)
+           AND datetime(timestamp) <= datetime(?)`,
+        [customerName, `${startDate}T00:00:00Z`, `${endDate}T23:59:59Z`],
+        (err2, row2) => {
+          if (err2) return done(err2);
+          return done(null, {
+            pallet_days: palletDays,
+            days_in_range: days,
+            handled_pallets: Number(row2?.handled || 0),
+            pallet_weeks: palletDays / 7,
+          });
+        }
+      );
+    }
+  );
+}
+
+function buildInvoicePreview(input, done) {
+  const customerName = String(input?.customer_name || "").trim();
+  const startDate = String(input?.start_date || "").trim();
+  const endDate = String(input?.end_date || "").trim();
+  const rateOverrideRaw = input?.rate_per_pallet_week;
+  const handlingFlatOverrideRaw = input?.handling_fee_flat;
+  const handlingPerPalletOverrideRaw = input?.handling_fee_per_pallet;
+
+  const rateOverride = Number(rateOverrideRaw);
+  const handlingFlatOverride = Number(handlingFlatOverrideRaw);
+  const handlingPerPalletOverride = Number(handlingPerPalletOverrideRaw);
+
+  if (!customerName || !startDate || !endDate) {
+    return done(new Error("customer_name, start_date, end_date are required"));
+  }
+
+  calculateInvoiceMetrics(customerName, startDate, endDate, (err, metrics) => {
+    if (err) return done(err);
+
+    db.get("SELECT * FROM customer_rates WHERE customer_name = ?", [customerName], (rateErr, rateRow) => {
+      if (rateErr) return done(rateErr);
+
+      const hasRateOverride = rateOverrideRaw !== undefined && rateOverrideRaw !== null && rateOverrideRaw !== "";
+      const hasFlatOverride = handlingFlatOverrideRaw !== undefined && handlingFlatOverrideRaw !== null && handlingFlatOverrideRaw !== "";
+      const hasPerPalletOverride = handlingPerPalletOverrideRaw !== undefined && handlingPerPalletOverrideRaw !== null && handlingPerPalletOverrideRaw !== "";
+
+      const ratePerWeek = hasRateOverride ? rateOverride : Number(rateRow?.rate_per_pallet_week || 0);
+      const handlingFlat = hasFlatOverride ? handlingFlatOverride : Number(rateRow?.handling_fee_flat || 0);
+      const handlingPerPallet = hasPerPalletOverride ? handlingPerPalletOverride : Number(rateRow?.handling_fee_per_pallet || 0);
+      const currency = String(rateRow?.currency || "GBP");
+
+      if (!Number.isFinite(ratePerWeek) || ratePerWeek < 0) {
+        return done(new Error("No valid customer weekly rate found. Set /api/rates first or pass rate_per_pallet_week."));
+      }
+      if (!Number.isFinite(handlingFlat) || handlingFlat < 0) {
+        return done(new Error("handling_fee_flat must be a valid number >= 0"));
+      }
+      if (!Number.isFinite(handlingPerPallet) || handlingPerPallet < 0) {
+        return done(new Error("handling_fee_per_pallet must be a valid number >= 0"));
+      }
+
+      const baseTotal = Number((metrics.pallet_weeks * ratePerWeek).toFixed(2));
+      const handlingTotal = Number((handlingFlat + (handlingPerPallet * metrics.handled_pallets)).toFixed(2));
+      const grandTotal = Number((baseTotal + handlingTotal).toFixed(2));
+
+      return done(null, {
+        ok: true,
+        billing_cycle: "WEEKLY",
+        customer_name: customerName,
+        start_date: startDate,
+        end_date: endDate,
+        days_in_range: metrics.days_in_range,
+        pallet_days: metrics.pallet_days,
+        pallet_weeks: Number(metrics.pallet_weeks.toFixed(4)),
+        handled_pallets: metrics.handled_pallets,
+        rate_per_pallet_week: ratePerWeek,
+        handling_fee_flat: handlingFlat,
+        handling_fee_per_pallet: handlingPerPallet,
+        currency,
+        base_total: baseTotal,
+        handling_total: handlingTotal,
+        total: grandTotal,
+      });
+    });
+  });
+}
+
+app.get("/api/rates", (req, res) => {
+  const customer = String(req.query.customer || "").trim();
+  if (customer) {
+    db.get("SELECT * FROM customer_rates WHERE customer_name = ?", [customer], (err, row) => {
+      if (err) return res.status(500).json({ error: "DB error" });
+      if (!row) return res.status(404).json({ error: "Rate not found" });
+      return res.json(row);
+    });
+    return;
+  }
+
+  db.all("SELECT * FROM customer_rates ORDER BY customer_name ASC", (err, rows) => {
+    if (err) return res.status(500).json({ error: "DB error" });
+    res.json(rows || []);
+  });
+});
+
+app.post("/api/rates", (req, res) => {
+  const customerName = String(req.body?.customer_name || "").trim();
+  const ratePerWeek = Number(req.body?.rate_per_pallet_week);
+  const handlingFlat = Number(req.body?.handling_fee_flat || 0);
+  const handlingPerPallet = Number(req.body?.handling_fee_per_pallet || 0);
+  const currency = String(req.body?.currency || "GBP").trim() || "GBP";
+
+  if (!customerName || !Number.isFinite(ratePerWeek) || ratePerWeek < 0) {
+    return res.status(400).json({ error: "customer_name and valid rate_per_pallet_week are required" });
+  }
+  if (!Number.isFinite(handlingFlat) || handlingFlat < 0) {
+    return res.status(400).json({ error: "handling_fee_flat must be a valid number >= 0" });
+  }
+  if (!Number.isFinite(handlingPerPallet) || handlingPerPallet < 0) {
+    return res.status(400).json({ error: "handling_fee_per_pallet must be a valid number >= 0" });
+  }
+
+  db.run(
+    `INSERT INTO customer_rates (customer_name, rate_per_pallet_week, handling_fee_flat, handling_fee_per_pallet, currency, updated_at)
+     VALUES (?, ?, ?, ?, ?, datetime('now'))
+     ON CONFLICT(customer_name) DO UPDATE SET
+       rate_per_pallet_week = excluded.rate_per_pallet_week,
+       handling_fee_flat = excluded.handling_fee_flat,
+       handling_fee_per_pallet = excluded.handling_fee_per_pallet,
+       currency = excluded.currency,
+       updated_at = datetime('now')`,
+    [customerName, ratePerWeek, handlingFlat, handlingPerPallet, currency],
+    (err) => {
+      if (err) return res.status(500).json({ error: "DB error" });
+      db.get("SELECT * FROM customer_rates WHERE customer_name = ?", [customerName], (err2, row) => {
+        if (err2) return res.status(500).json({ error: "DB error" });
+        res.json({ ok: true, rate: row });
+      });
+    }
+  );
+});
+
+app.get("/api/invoices", (req, res) => {
+  const customer = String(req.query.customer || "").trim();
+  const sql = customer
+    ? "SELECT * FROM invoices WHERE customer_name = ? ORDER BY id DESC LIMIT 200"
+    : "SELECT * FROM invoices ORDER BY id DESC LIMIT 200";
+
+  db.all(sql, customer ? [customer] : [], (err, rows) => {
+    if (err) return res.status(500).json({ error: "DB error" });
+    res.json(rows || []);
+  });
+});
+
+app.post("/api/invoices/preview", (req, res) => {
+  buildInvoicePreview(req.body || {}, (err, preview) => {
+    if (err) return res.status(400).json({ error: err.message || "Invalid invoice inputs" });
+    res.json(preview);
+  });
+});
+
+app.post("/api/invoices/generate", (req, res) => {
+  const customerName = String(req.body?.customer_name || "").trim();
+  let startDate = String(req.body?.start_date || "").trim();
+  let endDate = String(req.body?.end_date || "").trim();
+
+  if (!startDate && req.body?.week_start) {
+    startDate = String(req.body.week_start).trim();
+    endDate = addDaysYmd(startDate, 6) || "";
+  }
+
+  if (!customerName || !startDate || !endDate) {
+    return res.status(400).json({ error: "customer_name and either (start_date + end_date) or week_start are required" });
+  }
+
+  const previewInput = {
+    customer_name: customerName,
+    start_date: startDate,
+    end_date: endDate,
+    rate_per_pallet_week: req.body?.rate_per_pallet_week,
+    handling_fee_flat: req.body?.handling_fee_flat,
+    handling_fee_per_pallet: req.body?.handling_fee_per_pallet,
+  };
+
+  buildInvoicePreview(previewInput, (previewErr, preview) => {
+    if (previewErr) return res.status(400).json({ error: previewErr.message || "Invalid invoice inputs" });
+
+    const detailsJson = JSON.stringify({
+      days_in_range: preview.days_in_range,
+      pallet_weeks: preview.pallet_weeks,
+      handled_pallets: preview.handled_pallets,
+    });
+
+    db.run(
+      `INSERT INTO invoices (
+          customer_name, start_date, end_date, billing_cycle, pallet_days,
+          rate_per_pallet_day, rate_per_pallet_week,
+          handling_fee_flat, handling_fee_per_pallet, handled_pallets,
+          base_total, handling_total, total, currency, details_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        preview.customer_name,
+        preview.start_date,
+        preview.end_date,
+        "WEEKLY",
+        preview.pallet_days,
+        Number((preview.rate_per_pallet_week / 7).toFixed(6)),
+        preview.rate_per_pallet_week,
+        preview.handling_fee_flat,
+        preview.handling_fee_per_pallet,
+        preview.handled_pallets,
+        preview.base_total,
+        preview.handling_total,
+        preview.total,
+        preview.currency || "GBP",
+        detailsJson,
+      ],
+      function insertInvoice(err) {
+        if (err) return res.status(500).json({ error: "DB error" });
+        res.json({
+          ok: true,
+          invoice_id: this.lastID,
+          ...preview,
+        });
+      }
+    );
+  });
+});
+
 // Local IP helper
 function getLocalIPs() {
   const { networkInterfaces } = require("os");
@@ -850,111 +1210,6 @@ if (hasSSL) {
 
 // Start servers
 if (hasSSL) {
-  
-// -----------------------------
-// Invoicing (v1) - pallet-day billing
-// -----------------------------
-db.serialize(() => {
-  db.run(`CREATE TABLE IF NOT EXISTS customer_rates (
-    customer_name TEXT PRIMARY KEY,
-    rate_per_pallet_day REAL NOT NULL DEFAULT 0,
-    currency TEXT NOT NULL DEFAULT 'GBP',
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-  )`);
-
-  db.run(`CREATE TABLE IF NOT EXISTS invoices (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    customer_name TEXT NOT NULL,
-    start_date TEXT NOT NULL,
-    end_date TEXT NOT NULL,
-    pallet_days INTEGER NOT NULL,
-    rate_per_pallet_day REAL NOT NULL,
-    total REAL NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-  )`);
-});
-
-app.get('/api/invoices', (req, res) => {
-  const customer = req.query.customer;
-  const sql = customer
-    ? `SELECT * FROM invoices WHERE customer_name = ? ORDER BY id DESC LIMIT 200`
-    : `SELECT * FROM invoices ORDER BY id DESC LIMIT 200`;
-
-  db.all(sql, customer ? [customer] : [], (err, rows) => {
-    if (err) return res.status(500).json({ error: 'DB error' });
-    res.json(rows || []);
-  });
-});
-
-app.post('/api/invoices/generate', (req, res) => {
-  const customer_name = String(req.body?.customer_name || '').trim();
-  const start_date = String(req.body?.start_date || '').trim();
-  const end_date = String(req.body?.end_date || '').trim();
-  const rate = Number(req.body?.rate_per_pallet_day || 0);
-
-  if (!customer_name || !start_date || !end_date || !Number.isFinite(rate) || rate <= 0) {
-    return res.status(400).json({ error: 'customer_name, start_date, end_date, rate_per_pallet_day required' });
-  }
-
-  const start = new Date(start_date + 'T00:00:00Z');
-  const end = new Date(end_date + 'T00:00:00Z');
-  if (isNaN(start) || isNaN(end) || end < start) return res.status(400).json({ error: 'Invalid date range' });
-
-  db.all(
-    `SELECT pallet_id, action, quantity_after, timestamp
-     FROM activity_log
-     WHERE customer_name = ?
-       AND datetime(timestamp) <= datetime(?)
-     ORDER BY datetime(timestamp) ASC`,
-    [customer_name, end_date + 'T23:59:59Z'],
-    (err, rows) => {
-      if (err) return res.status(500).json({ error: 'DB error' });
-
-      const state = new Map();
-      let idx = 0;
-      const dayMs = 24 * 60 * 60 * 1000;
-      const days = Math.floor((end - start) / dayMs) + 1;
-
-      const endOfDayIso = (d) => new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 23, 59, 59)).toISOString();
-
-      let palletDays = 0;
-
-      for (let di = 0; di < days; di++) {
-        const day = new Date(start.getTime() + di * dayMs);
-        const cutoff = endOfDayIso(day);
-
-        while (idx < rows.length && new Date(rows[idx].timestamp).toISOString() <= cutoff) {
-          const r = rows[idx];
-          const qty = Number(r.quantity_after) || 0;
-
-          if (r.action === 'CHECK_IN') state.set(r.pallet_id, qty);
-          else if (r.action === 'CHECK_OUT') state.delete(r.pallet_id);
-          else if (r.action === 'PARTIAL_REMOVE') (qty > 0 ? state.set(r.pallet_id, qty) : state.delete(r.pallet_id));
-
-          idx++;
-        }
-
-        let occ = 0;
-        for (const q of state.values()) occ += (Number(q) || 0);
-        palletDays += occ;
-      }
-
-      const total = Number((palletDays * rate).toFixed(2));
-
-      db.run(
-        `INSERT INTO invoices (customer_name, start_date, end_date, pallet_days, rate_per_pallet_day, total)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [customer_name, start_date, end_date, palletDays, rate, total],
-        function (err2) {
-          if (err2) return res.status(500).json({ error: 'DB error' });
-          res.json({ ok: true, invoice_id: this.lastID, customer_name, start_date, end_date, pallet_days: palletDays, rate_per_pallet_day: rate, total });
-        }
-      );
-    }
-  );
-});
-
-
 httpsServer.listen(HTTPS_PORT, "0.0.0.0", () => {
     console.log("\n🔒 HTTPS Warehouse Server Running (with WebSocket)!");
     console.log(`\n📱 Secure access (recommended):`);
