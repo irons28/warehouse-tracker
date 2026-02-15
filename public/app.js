@@ -87,8 +87,23 @@
   // --------------------------
   async function apiFetch(path, opts = {}) {
     const url = path.startsWith("http") ? path : `${API_URL}${path}`;
+    let userRole = "ops";
+    let actorId = "ops-user";
+    let authToken = "";
+    try {
+      userRole = localStorage.getItem("wt_user_role") || userRole;
+      actorId = localStorage.getItem("wt_actor_id") || actorId;
+      authToken = localStorage.getItem("wt_auth_token") || "";
+    } catch {
+      // ignore
+    }
     const headers = Object.assign(
-      { "Content-Type": "application/json" },
+      {
+        "Content-Type": "application/json",
+        "x-user-role": userRole,
+        "x-actor-id": actorId,
+        ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+      },
       opts.headers || {}
     );
 
@@ -103,6 +118,12 @@
     const isJson = ct.includes("application/json");
 
     if (!res.ok) {
+      if (res.status === 401) {
+        try {
+          localStorage.removeItem("wt_auth_token");
+        } catch {}
+        window.dispatchEvent(new CustomEvent("wt-auth-required"));
+      }
       let msg = `${res.status} ${res.statusText}`;
       if (isJson) {
         try {
@@ -138,7 +159,7 @@
     searchTerm: "",
 
     // scanner
-    scanMode: null,            // 'checkin-pallet' | 'checkin-location' | 'checkout' | 'checkout-units'
+    scanMode: null,            // 'checkin-pallet' | 'checkin-location' | 'checkout' | 'checkout-units' | 'move-pallet' | 'move-location'
     _scannedPallet: null,      // holds pallet QR payload between scans
     scanner: null,
     _scanBusy: false,
@@ -158,8 +179,14 @@
     lastUpdatedAt: "",
     loading: false,
     trackerDensity: "comfy", // "comfy" | "compact"
+    currentUser: null,
+    authLoading: true,
+    actorId: "ops-user",
+    clientSessionId: "",
     rates: [],
     invoices: [],
+    authUsers: [],
+    invoiceAging: { buckets: { current: { count: 0, amount: 0 }, d1_30: { count: 0, amount: 0 }, d31_60: { count: 0, amount: 0 }, d61_plus: { count: 0, amount: 0 } }, total_outstanding: 0, total_count: 0 },
     invoicePreview: null,
     invoiceForm: {
       customer_name: "",
@@ -377,6 +404,36 @@
       this.setTrackerDensity(this.trackerDensity === "compact" ? "comfy" : "compact");
     },
 
+    renderAuth() {
+      return `
+        <div class="min-h-screen flex items-center justify-center p-6">
+          <div class="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+            <div class="text-sm font-semibold text-slate-600">Phase 3 Access</div>
+            <h1 class="mt-1 text-2xl font-extrabold text-slate-900">Sign in</h1>
+            <p class="mt-2 text-sm text-slate-600">Use your warehouse tracker account to continue.</p>
+
+            <div class="mt-4 space-y-3">
+              <div>
+                <label class="text-sm font-semibold text-slate-700">Username</label>
+                <input id="auth-username" class="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 text-sm" placeholder="username" />
+              </div>
+              <div>
+                <label class="text-sm font-semibold text-slate-700">Password</label>
+                <input id="auth-password" type="password" class="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 text-sm" placeholder="password" />
+              </div>
+            </div>
+
+            <div class="mt-5 flex gap-2">
+              <button class="rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800"
+                onclick="app.loginFromForm().catch(e=>app.showToast(e.message || 'Login failed','error'))">
+                Sign in
+              </button>
+            </div>
+          </div>
+        </div>
+      `;
+    },
+
     renderShell(contentHtml) {
       const sidebarOpen = !!this.sidebarOpen;
 
@@ -400,6 +457,10 @@
                 <span class="wt-dot is-ok"></span>
                 <span id="wt-last-text">—</span>
               </span>
+              <span class="wt-pill wt-pill-gray" title="Signed in user">
+                ${this.currentUser ? `${this.currentUser.display_name || this.currentUser.username} (${this.currentUser.role})` : "Guest"}
+              </span>
+              <button class="wt-icon-btn" onclick="app.logout().catch(()=>{})">Logout</button>
             </div>
           </div>
 
@@ -446,6 +507,16 @@
     render() {
       const appEl = document.getElementById("app");
       if (!appEl) return;
+
+      if (this.authLoading) {
+        appEl.innerHTML = `<div class="min-h-screen flex items-center justify-center text-slate-600">Loading…</div>`;
+        return;
+      }
+
+      if (!this.currentUser) {
+        appEl.innerHTML = this.renderAuth();
+        return;
+      }
 
       if (this.scanMode) {
         appEl.innerHTML = this.renderScanner();
@@ -564,7 +635,7 @@
         return Number.isFinite(t) && (now - t) <= 30 * 24 * 60 * 60 * 1000;
       });
       const overdueInvoices = invoices.filter((inv) => this._invoiceIsOverdue(inv));
-      const overdueAmount = overdueInvoices.reduce((sum, inv) => sum + (Number(inv.total) || 0), 0);
+      const overdueAmount = overdueInvoices.reduce((sum, inv) => sum + Math.max(0, (Number(inv.total) || 0) - (Number(inv.amount_paid) || 0)), 0);
       const revenue30d = invoice30d.reduce((sum, i) => sum + (Number(i.total) || 0), 0);
       const handling30d = invoice30d.reduce((sum, i) => sum + (Number(i.handling_total) || 0), 0);
       const handlingShare30d = revenue30d > 0 ? ((handling30d / revenue30d) * 100).toFixed(1) : "0.0";
@@ -594,6 +665,8 @@
       const recent = activity.slice(0, 8);
       const recentInvoices = invoices.slice(0, 8);
       const dashboardCurrency = recentInvoices[0]?.currency || "GBP";
+      const aging = this.invoiceAging || {};
+      const agingBuckets = aging.buckets || {};
 
       return `
         <div class="space-y-5 fade-in">
@@ -723,6 +796,19 @@
                 }
               </div>
             </section>
+
+            <section class="wt-dash-panel">
+              <div class="wt-dash-panel-head">
+                <div class="wt-dash-panel-title">A/R Aging</div>
+                <div class="wt-dash-panel-meta">${dashboardCurrency} ${Number(aging.total_outstanding || 0).toFixed(2)} outstanding</div>
+              </div>
+              <div class="wt-dash-list">
+                <div class="wt-dash-list-row"><span>Current</span><span class="wt-dash-list-value">${dashboardCurrency} ${Number(agingBuckets.current?.amount || 0).toFixed(2)}</span></div>
+                <div class="wt-dash-list-row"><span>1-30 overdue</span><span class="wt-dash-list-value">${dashboardCurrency} ${Number(agingBuckets.d1_30?.amount || 0).toFixed(2)}</span></div>
+                <div class="wt-dash-list-row"><span>31-60 overdue</span><span class="wt-dash-list-value">${dashboardCurrency} ${Number(agingBuckets.d31_60?.amount || 0).toFixed(2)}</span></div>
+                <div class="wt-dash-list-row"><span>61+ overdue</span><span class="wt-dash-list-value">${dashboardCurrency} ${Number(agingBuckets.d61_plus?.amount || 0).toFixed(2)}</span></div>
+              </div>
+            </section>
           </div>
         </div>
       `;
@@ -798,6 +884,22 @@
                   </div>
                 </button>
 
+                <button type="button" onclick="app.startScanner('move-pallet')"
+                  class="group w-full rounded-2xl border border-slate-200 bg-white p-5 text-left shadow-sm transition hover:-translate-y-[1px] hover:border-slate-300 hover:shadow-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                  <div class="flex items-start gap-4">
+                    <div class="flex h-11 w-11 items-center justify-center rounded-xl bg-indigo-500/10 text-indigo-700">
+                      <span class="text-lg font-black">MV</span>
+                    </div>
+                    <div class="min-w-0">
+                      <div class="flex items-center gap-2">
+                        <div class="text-base font-bold text-slate-900">Move pallet</div>
+                        <span class="rounded-full bg-indigo-500/10 px-2 py-0.5 text-xs font-semibold text-indigo-700">relocate</span>
+                      </div>
+                      <div class="mt-1 text-sm text-slate-600">Scan pallet QR, then scan the new location.</div>
+                    </div>
+                  </div>
+                </button>
+
                 <button type="button" onclick="app.showManualEntry()"
                   class="group w-full rounded-2xl border border-slate-200 bg-white p-5 text-left shadow-sm transition hover:-translate-y-[1px] hover:border-slate-300 hover:shadow-md focus:outline-none focus:ring-2 focus:ring-blue-500">
                   <div class="flex items-start gap-4">
@@ -844,7 +946,9 @@
         this.scanMode === "checkin-pallet" ? "Scan pallet QR" :
         this.scanMode === "checkin-location" ? "Scan location QR" :
         this.scanMode === "checkout" ? "Scan pallet to check out" :
-        this.scanMode === "checkout-units" ? "Scan pallet to remove units" : "Scan";
+        this.scanMode === "checkout-units" ? "Scan pallet to remove units" :
+        this.scanMode === "move-pallet" ? "Scan pallet to move" :
+        this.scanMode === "move-location" ? "Scan destination location QR" : "Scan";
 
       return `
         <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4">
@@ -1017,10 +1121,10 @@
       const invoiceCurrency = normalized[0]?.currency || "GBP";
       const outstanding = normalized
         .filter((r) => r.status !== "PAID")
-        .reduce((sum, r) => sum + (Number(r.total) || 0), 0);
+        .reduce((sum, r) => sum + Math.max(0, (Number(r.total) || 0) - (Number(r.amount_paid) || 0)), 0);
       const overdue = normalized
         .filter((r) => this._invoiceIsOverdue(r))
-        .reduce((sum, r) => sum + (Number(r.total) || 0), 0);
+        .reduce((sum, r) => sum + Math.max(0, (Number(r.total) || 0) - (Number(r.amount_paid) || 0)), 0);
 
       return `
         <div class="space-y-5 fade-in">
@@ -1072,6 +1176,8 @@
                   <th class="wt-th-num">Rate/Week</th>
                   <th class="wt-th-num">Handling</th>
                   <th class="wt-th-num">Total</th>
+                  <th class="wt-th-num">Paid</th>
+                  <th class="wt-th-num">Balance</th>
                   <th>Status</th>
                   <th>Due</th>
                   <th>Created</th>
@@ -1090,6 +1196,8 @@
                           <td class="wt-cell wt-num">${r.currency || "GBP"} ${Number(r.rate_per_pallet_week || 0).toFixed(2)}</td>
                           <td class="wt-cell wt-num">${r.currency || "GBP"} ${Number(r.handling_total || 0).toFixed(2)}</td>
                           <td class="wt-cell wt-num wt-strong">${r.currency || "GBP"} ${Number(r.total || 0).toFixed(2)}</td>
+                          <td class="wt-cell wt-num">${r.currency || "GBP"} ${Number(r.amount_paid || 0).toFixed(2)}</td>
+                          <td class="wt-cell wt-num wt-strong">${r.currency || "GBP"} ${Math.max(0, Number(r.total || 0) - Number(r.amount_paid || 0)).toFixed(2)}</td>
                           <td class="wt-cell">
                             <span class="wt-status-badge wt-status-${String(r.status || "DRAFT").toLowerCase()}">${r.status || "DRAFT"}</span>
                           </td>
@@ -1100,6 +1208,7 @@
                               ${r.status !== "SENT" ? `<button class="wt-btn wt-btn-blue" onclick="app.setInvoiceStatus(${Number(r.id)}, 'SENT')">Mark Sent</button>` : ""}
                               ${r.status !== "PAID" ? `<button class="wt-btn wt-btn-green" onclick="app.setInvoiceStatus(${Number(r.id)}, 'PAID')">Mark Paid</button>` : ""}
                               ${r.status !== "DRAFT" ? `<button class="wt-btn wt-btn-slate" onclick="app.setInvoiceStatus(${Number(r.id)}, 'DRAFT')">Set Draft</button>` : ""}
+                              ${Math.max(0, Number(r.total || 0) - Number(r.amount_paid || 0)) > 0 ? `<button class="wt-btn wt-btn-orange" onclick="app.recordInvoicePayment(${Number(r.id)})">Record Payment</button>` : ""}
                               <button class="wt-btn wt-btn-purple" onclick="app.exportInvoiceCsv(${Number(r.id)})">CSV</button>
                             </div>
                           </td>
@@ -1107,7 +1216,7 @@
                       `).join("")
                     : `
                       <tr>
-                        <td class="wt-cell" colspan="11">
+                        <td class="wt-cell" colspan="13">
                           <div class="py-10 text-center text-slate-500">
                             <div class="text-4xl mb-2">🧾</div>
                             No invoices yet.
@@ -1175,11 +1284,13 @@
     renderSettings() {
       const url = this.googleSheetsUrl || "";
       this.ensureInvoiceFormDefaults();
+      const isAdmin = ["owner", "admin"].includes(String(this.currentUser?.role || "").toLowerCase());
       const knownCustomers = Array.from(new Set([
         ...(this.customers || []),
         ...((this.rates || []).map((r) => r.customer_name).filter(Boolean)),
       ])).sort();
       const preview = this.invoicePreview;
+      const users = Array.isArray(this.authUsers) ? this.authUsers : [];
       return `
         <div class="space-y-5 fade-in">
           <div>
@@ -1307,6 +1418,72 @@
                 : ""
             }
           </div>
+
+          ${
+            isAdmin
+              ? `
+                <div class="rounded-2xl border border-slate-200 bg-white p-5 space-y-4">
+                  <div class="flex items-end justify-between gap-3">
+                    <div>
+                      <div class="font-bold text-slate-900">User Management (Phase 3.1)</div>
+                      <div class="mt-1 text-sm text-slate-600">Create users, set role/scope, and activate/deactivate accounts.</div>
+                    </div>
+                    <button class="rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800"
+                      onclick="app.createUserFlow().catch(e=>app.showToast(e.message || 'Create user failed','error'))">
+                      New User
+                    </button>
+                  </div>
+
+                  <div class="wt-table-wrap">
+                    <table class="wt-table wt-density-compact">
+                      <thead>
+                        <tr>
+                          <th>ID</th>
+                          <th>Username</th>
+                          <th>Name</th>
+                          <th>Role</th>
+                          <th>Scope</th>
+                          <th>Status</th>
+                          <th>Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        ${
+                          users.length
+                            ? users.map((u) => `
+                                <tr class="wt-row">
+                                  <td class="wt-cell wt-strong">${u.id}</td>
+                                  <td class="wt-cell">${u.username || ""}</td>
+                                  <td class="wt-cell">${u.display_name || ""}</td>
+                                  <td class="wt-cell">${u.role || ""}</td>
+                                  <td class="wt-cell">${u.customer_scope || "*"}</td>
+                                  <td class="wt-cell">${Number(u.is_active) ? "Active" : "Disabled"}</td>
+                                  <td class="wt-cell">
+                                    <div class="wt-actions">
+                                      <button class="wt-btn wt-btn-blue" onclick="app.editUserFlow(${Number(u.id)}).catch(e=>app.showToast(e.message || 'Edit user failed','error'))">Edit</button>
+                                      <button class="wt-btn wt-btn-orange" onclick="app.resetUserPasswordFlow(${Number(u.id)}).catch(e=>app.showToast(e.message || 'Reset password failed','error'))">Reset PW</button>
+                                      <button class="wt-btn ${Number(u.is_active) ? "wt-btn-slate" : "wt-btn-green"}" onclick="app.toggleUserActive(${Number(u.id)}, ${Number(u.is_active) ? 0 : 1}).catch(e=>app.showToast(e.message || 'Update status failed','error'))">
+                                        ${Number(u.is_active) ? "Disable" : "Enable"}
+                                      </button>
+                                    </div>
+                                  </td>
+                                </tr>
+                              `).join("")
+                            : `
+                              <tr>
+                                <td class="wt-cell" colspan="7">
+                                  <div class="py-8 text-center text-slate-500">No users found.</div>
+                                </td>
+                              </tr>
+                            `
+                        }
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              `
+              : ""
+          }
         </div>
       `;
     },
@@ -1383,6 +1560,8 @@
           this.loadSettings(),
           this.loadRates(),
           this.loadInvoices(),
+          this.loadInvoiceAging(),
+          this.loadAuthUsers(),
         ]);
         this.lastUpdatedAt = new Date().toLocaleTimeString();
         this._updateTopRightLastUpdated();
@@ -1425,6 +1604,195 @@
       }
     },
 
+    async loadCurrentUser() {
+      try {
+        const me = await apiFetch(`/api/auth/me?_t=${Date.now()}`);
+        if (me?.user) {
+          this.currentUser = me.user;
+          this.actorId = me.user.username || this.actorId || "ops-user";
+          try {
+            localStorage.setItem("wt_actor_id", this.actorId);
+            localStorage.setItem("wt_user_role", String(me.user.role || "ops"));
+          } catch {}
+          return true;
+        }
+      } catch {
+        // ignore
+      }
+      this.currentUser = null;
+      return false;
+    },
+
+    async loadAuthUsers() {
+      try {
+        const role = String(this.currentUser?.role || "").toLowerCase();
+        if (!["owner", "admin"].includes(role)) {
+          this.authUsers = [];
+          return;
+        }
+        const users = await apiFetch(`/api/auth/users?_t=${Date.now()}`);
+        this.authUsers = Array.isArray(users) ? users : [];
+      } catch {
+        this.authUsers = [];
+      }
+    },
+
+    async login(username, password) {
+      const u = String(username || "").trim();
+      const p = String(password || "");
+      if (!u || !p) throw new Error("Username and password are required");
+
+      const res = await apiFetch(`/api/auth/login`, {
+        method: "POST",
+        body: JSON.stringify({ username: u, password: p }),
+      });
+      if (!res?.token || !res?.user) throw new Error("Invalid login response");
+      try {
+        localStorage.setItem("wt_auth_token", res.token);
+        localStorage.setItem("wt_actor_id", String(res.user.username || "ops-user"));
+        localStorage.setItem("wt_user_role", String(res.user.role || "ops"));
+      } catch {}
+      this.currentUser = res.user;
+      this.actorId = String(res.user.username || "ops-user");
+      this.authLoading = false;
+      await this.refreshAll();
+      if (!this.socket) this.connectSocket();
+      this.render();
+    },
+
+    async loginFromForm() {
+      const u = document.getElementById("auth-username");
+      const p = document.getElementById("auth-password");
+      const username = String(u?.value || "").trim();
+      const password = String(p?.value || "");
+      await this.login(username, password);
+      this.showToast(`Signed in as ${username}`, "success");
+    },
+
+    async logout() {
+      try {
+        await apiFetch(`/api/auth/logout`, { method: "POST", body: JSON.stringify({}) });
+      } catch {
+        // ignore
+      }
+      try {
+        if (this.socket) {
+          this.socket.disconnect();
+          this.socket = null;
+        }
+      } catch {}
+      try {
+        localStorage.removeItem("wt_auth_token");
+      } catch {}
+      this.currentUser = null;
+      this.authLoading = false;
+      this.scanMode = null;
+      this.render();
+    },
+
+    _findAuthUser(userId) {
+      const id = Number(userId);
+      return (this.authUsers || []).find((u) => Number(u.id) === id) || null;
+    },
+
+    async createUserFlow() {
+      const username = await this.prompt("New user", "Username:");
+      if (username === null) return;
+      const cleanUsername = String(username || "").trim();
+      if (!cleanUsername) return this.showToast("Username is required", "error");
+
+      const displayName = await this.prompt("New user", "Display name:", cleanUsername);
+      if (displayName === null) return;
+
+      const role = await this.prompt("New user", "Role (owner/admin/ops/viewer):", "ops");
+      if (role === null) return;
+      const cleanRole = String(role || "").trim().toLowerCase();
+
+      const scope = await this.prompt("New user", "Customer scope (* or comma list):", "*");
+      if (scope === null) return;
+
+      const password = await this.prompt("New user", "Temporary password (min 8 chars):", "");
+      if (password === null) return;
+      const cleanPassword = String(password || "");
+      if (cleanPassword.length < 8) return this.showToast("Password must be at least 8 characters", "error");
+
+      await apiFetch("/api/auth/users", {
+        method: "POST",
+        body: JSON.stringify({
+          username: cleanUsername,
+          password: cleanPassword,
+          role: cleanRole,
+          display_name: String(displayName || "").trim() || cleanUsername,
+          customer_scope: String(scope || "*").trim() || "*",
+          is_active: 1,
+        }),
+      });
+
+      await this.loadAuthUsers();
+      this.showToast(`User ${cleanUsername} created`, "success");
+      this.render();
+    },
+
+    async editUserFlow(userId) {
+      const user = this._findAuthUser(userId);
+      if (!user) return this.showToast("User not found", "error");
+
+      const displayName = await this.prompt("Edit user", `Display name for ${user.username}:`, user.display_name || user.username);
+      if (displayName === null) return;
+
+      const role = await this.prompt("Edit user", `Role for ${user.username}:`, user.role || "ops");
+      if (role === null) return;
+
+      const scope = await this.prompt("Edit user", `Customer scope for ${user.username}:`, user.customer_scope || "*");
+      if (scope === null) return;
+
+      await apiFetch(`/api/auth/users/${Number(user.id)}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          display_name: String(displayName || "").trim(),
+          role: String(role || "").trim().toLowerCase(),
+          customer_scope: String(scope || "*").trim() || "*",
+        }),
+      });
+
+      await this.loadAuthUsers();
+      this.showToast(`User ${user.username} updated`, "success");
+      this.render();
+    },
+
+    async resetUserPasswordFlow(userId) {
+      const user = this._findAuthUser(userId);
+      if (!user) return this.showToast("User not found", "error");
+      const password = await this.prompt("Reset password", `New password for ${user.username}:`, "");
+      if (password === null) return;
+      const cleanPassword = String(password || "");
+      if (cleanPassword.length < 8) return this.showToast("Password must be at least 8 characters", "error");
+
+      await apiFetch(`/api/auth/users/${Number(user.id)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ password: cleanPassword }),
+      });
+
+      this.showToast(`Password reset for ${user.username}`, "success");
+    },
+
+    async toggleUserActive(userId, nextActive) {
+      const user = this._findAuthUser(userId);
+      if (!user) return this.showToast("User not found", "error");
+      if (Number(user.id) === Number(this.currentUser?.id) && !Number(nextActive)) {
+        return this.showToast("You cannot disable your own account", "error");
+      }
+
+      await apiFetch(`/api/auth/users/${Number(user.id)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ is_active: Number(nextActive) ? 1 : 0 }),
+      });
+
+      await this.loadAuthUsers();
+      this.showToast(`User ${user.username} ${Number(nextActive) ? "enabled" : "disabled"}`, "success");
+      this.render();
+    },
+
     async loadRates() {
       try {
         const data = await apiFetch(`/api/rates?_t=${Date.now()}`);
@@ -1440,6 +1808,15 @@
         this.invoices = Array.isArray(data) ? data : [];
       } catch {
         this.invoices = [];
+      }
+    },
+
+    async loadInvoiceAging() {
+      try {
+        const data = await apiFetch(`/api/invoices/aging?_t=${Date.now()}`);
+        this.invoiceAging = data && typeof data === "object" ? data : this.invoiceAging;
+      } catch {
+        this.invoiceAging = this.invoiceAging || { buckets: {}, total_outstanding: 0, total_count: 0 };
       }
     },
 
@@ -1459,6 +1836,8 @@
     _invoiceIsOverdue(inv) {
       const status = this._normalizedInvoiceStatus(inv?.status);
       if (status === "PAID") return false;
+      const balance = Math.max(0, (Number(inv?.total) || 0) - (Number(inv?.amount_paid) || 0));
+      if (balance <= 0) return false;
       const dueMs = this._parseYmdToUtcMs(inv?.due_date);
       if (!Number.isFinite(dueMs)) return false;
       const now = new Date();
@@ -1599,6 +1978,7 @@
       });
 
       await this.loadInvoices();
+      await this.loadInvoiceAging();
       this.invoicePreview = generated;
       this.showToast(`Invoice #${generated.invoice_id} created`, "success");
       this.render();
@@ -1615,7 +1995,38 @@
       });
 
       await this.loadInvoices();
+      await this.loadInvoiceAging();
       this.showToast(`Invoice #${id} set to ${nextStatus}`, "success");
+      this.render();
+    },
+
+    async recordInvoicePayment(invoiceId) {
+      const id = Number(invoiceId);
+      const inv = (this.invoices || []).find((r) => Number(r.id) === id);
+      if (!inv) return this.showToast("Invoice not found", "error");
+
+      const balance = Math.max(0, Number(inv.total || 0) - Number(inv.amount_paid || 0));
+      if (balance <= 0) return this.showToast("Invoice already fully paid", "info");
+
+      const amountStr = await this.prompt("Record payment", `Amount received for invoice #${id} (max ${inv.currency || "GBP"} ${balance.toFixed(2)}):`, balance.toFixed(2));
+      if (amountStr === null) return;
+      const amount = Number(amountStr);
+      if (!Number.isFinite(amount) || amount <= 0) return this.showToast("Enter a valid payment amount", "error");
+
+      const note = await this.prompt("Payment note (optional)", "Reference / bank note:", "");
+      if (note === null) return;
+
+      await apiFetch(`/api/invoices/${id}/payments`, {
+        method: "POST",
+        body: JSON.stringify({
+          amount,
+          note: String(note || "").trim(),
+        }),
+      });
+
+      await this.loadInvoices();
+      await this.loadInvoiceAging();
+      this.showToast(`Payment recorded on invoice #${id}`, "success");
       this.render();
     },
 
@@ -1650,6 +2061,9 @@
         ["total", Number(inv.total || 0).toFixed(2)],
         ["payment_terms_days", Number(inv.payment_terms_days || 7)],
         ["due_date", inv.due_date || ""],
+        ["amount_paid", Number(inv.amount_paid || 0).toFixed(2)],
+        ["balance_due", Math.max(0, Number(inv.total || 0) - Number(inv.amount_paid || 0)).toFixed(2)],
+        ["payment_status", inv.payment_status || ""],
         ["created_at", inv.created_at || ""],
         ["sent_at", inv.sent_at || ""],
         ["paid_at", inv.paid_at || ""],
@@ -2036,6 +2450,45 @@ PART-ABC x 2"></textarea>
         this.setView("tracker");
         return;
       }
+
+      // MOVE FLOW
+      if (this.scanMode === "move-pallet") {
+        const payload = wtParsePalletQr(raw);
+        const id = payload?.id || String(text).trim();
+        if (!id) {
+          this.showToast("Invalid pallet QR", "error");
+          return;
+        }
+
+        this._scannedPallet = { id };
+        this.scanMode = "move-location";
+        this.showToast(`Pallet scanned: ${id}`, "success");
+        this.render();
+        return;
+      }
+
+      if (this.scanMode === "move-location") {
+        const loc = raw.toUpperCase();
+        const pal = this._scannedPallet;
+        if (!pal?.id) {
+          this.showToast("Missing pallet step. Scan pallet first.", "error");
+          return;
+        }
+
+        const knownLocations = new Set((this.locations || []).map((x) => String(x.id || "").toUpperCase()).filter(Boolean));
+        if (knownLocations.size > 0 && !knownLocations.has(loc)) {
+          this.showToast(`Unknown location: ${loc}`, "error");
+          return;
+        }
+
+        await this.stopScanner(true);
+        const ok = await this.confirm("Move pallet", `Move ${pal.id} to ${loc}?`);
+        if (!ok) return this.setView("scan");
+
+        await this.movePallet(pal.id, loc, "Scan");
+        this.setView("tracker");
+        return;
+      }
       } finally {
         setTimeout(() => {
           this._scanBusy = false;
@@ -2047,8 +2500,24 @@ PART-ABC x 2"></textarea>
     // Server mutations
     // --------------------------
 
+  _makeIdempotencyKey(action, parts = []) {
+    const bucket = Math.floor(Date.now() / 3000); // 3s window for duplicate scan suppression
+    const sig = [action, ...parts.map((x) => String(x ?? "").trim().toUpperCase()), bucket].join("|");
+    return sig;
+  },
+
+  _auditMeta(scannedBy = "Scan", idempotencyKey = "") {
+    return {
+      scanned_by: scannedBy,
+      actor_id: this.actorId || "ops-user",
+      client_session_id: this.clientSessionId || "unknown-session",
+      idempotency_key: idempotencyKey || "",
+    };
+  },
+
   async checkIn(customerName, productId, palletQuantity, productQuantity, location, parts = null, scannedBy = 'Manual entry', palletId = null) {
     try {
+      const idempotencyKey = this._makeIdempotencyKey("CHECK_IN", [palletId || "", customerName, productId, location, palletQuantity, productQuantity]);
       const payload = {
         id: palletId || null, // server can generate if omitted
         customer_name: customerName,
@@ -2057,7 +2526,7 @@ PART-ABC x 2"></textarea>
         product_quantity: productQuantity,
         location,
         parts,
-        scanned_by: scannedBy,
+        ...this._auditMeta(scannedBy, idempotencyKey),
       };
 
       const result = await apiFetch('/api/pallets', {
@@ -2077,9 +2546,11 @@ PART-ABC x 2"></textarea>
   async checkOut(palletId, scannedBy = 'Scan') {
     try {
       if (!palletId) throw new Error('Missing pallet id');
+      const idempotencyKey = this._makeIdempotencyKey("CHECK_OUT", [palletId]);
 
       await apiFetch(`/api/pallets/${encodeURIComponent(palletId)}`, {
         method: 'DELETE',
+        body: JSON.stringify(this._auditMeta(scannedBy, idempotencyKey)),
       });
 
       this.showToast('✅ Pallet checked out!', 'success');
@@ -2087,6 +2558,31 @@ PART-ABC x 2"></textarea>
     } catch (error) {
       console.error('Check-out error:', error);
       this.showToast(`Check-out failed: ${error.message}`, 'error');
+    }
+  },
+
+  async movePallet(palletId, toLocation, scannedBy = 'Scan') {
+    try {
+      if (!palletId) throw new Error('Missing pallet id');
+      const target = String(toLocation || "").trim().toUpperCase();
+      if (!target) throw new Error('Missing target location');
+      const idempotencyKey = this._makeIdempotencyKey("MOVE", [palletId, target]);
+
+      await apiFetch(`/api/pallets/${encodeURIComponent(palletId)}/move`, {
+        method: 'POST',
+        body: JSON.stringify({
+          to_location: target,
+          ...this._auditMeta(scannedBy, idempotencyKey),
+        }),
+      });
+
+      this.showToast(`✅ Pallet moved to ${target}`, 'success');
+      await this.loadPallets();
+      await this.loadActivity();
+      await this.loadStats();
+    } catch (error) {
+      console.error('Move pallet error:', error);
+      this.showToast(`Move failed: ${error.message}`, 'error');
     }
   },
 
@@ -2107,7 +2603,7 @@ PART-ABC x 2"></textarea>
 
       const payload = {
         units_to_remove: finalUnits,
-        scanned_by: scannedBy,
+        ...this._auditMeta(scannedBy, this._makeIdempotencyKey("UNITS_REMOVE", [palletId, finalUnits])),
       };
 
       await apiFetch(`/api/pallets/${encodeURIComponent(palletId)}/remove-units`, {
@@ -2289,8 +2785,26 @@ PART-ABC x 2"></textarea>
     // Init
     // --------------------------
     async init() {
+      window.addEventListener("wt-auth-required", () => {
+        this.currentUser = null;
+        this.authLoading = false;
+        this.render();
+      });
       try {
         this.ensureInvoiceFormDefaults();
+        try {
+          const existingSession = localStorage.getItem("wt_client_session_id");
+          const existingActor = localStorage.getItem("wt_actor_id");
+          const existingRole = localStorage.getItem("wt_user_role");
+          this.clientSessionId = existingSession || (crypto?.randomUUID ? crypto.randomUUID() : `sess-${Date.now()}`);
+          this.actorId = existingActor || "ops-user";
+          if (!existingRole) localStorage.setItem("wt_user_role", "ops");
+          if (!existingSession) localStorage.setItem("wt_client_session_id", this.clientSessionId);
+          if (!existingActor) localStorage.setItem("wt_actor_id", this.actorId);
+        } catch {
+          this.clientSessionId = `sess-${Date.now()}`;
+          this.actorId = "ops-user";
+        }
         try {
           const savedDensity = localStorage.getItem("wt_tracker_density");
           if (savedDensity === "compact" || savedDensity === "comfy") {
@@ -2300,11 +2814,15 @@ PART-ABC x 2"></textarea>
           // ignore
         }
 
-        await this.refreshAll();
+        const hasUser = await this.loadCurrentUser();
+        if (hasUser) {
+          await this.refreshAll();
+          this.connectSocket();
+        }
       } catch {
         // ignore
       }
-      this.connectSocket();
+      this.authLoading = false;
       this.render();
     },
   };

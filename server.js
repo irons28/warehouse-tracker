@@ -6,6 +6,7 @@ const path = require("path");
 const https = require("https");
 const http = require("http");
 const fs = require("fs");
+const crypto = require("crypto");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -16,6 +17,24 @@ const settingsPath = path.join(__dirname, "server-settings.json");
 app.use(cors());
 app.use(bodyParser.json());
 app.use(express.static("public"));
+
+function requireWriteRole(req, res, next) {
+  const role = String(req.user?.role || "").toLowerCase();
+  const allowed = new Set(["owner", "admin", "ops"]);
+  if (!allowed.has(role)) {
+    return res.status(403).json({ error: "Insufficient role for write operation" });
+  }
+  return next();
+}
+
+function requireAdminRole(req, res, next) {
+  const role = String(req.user?.role || "").toLowerCase();
+  const allowed = new Set(["owner", "admin"]);
+  if (!allowed.has(role)) {
+    return res.status(403).json({ error: "Admin role required" });
+  }
+  return next();
+}
 
 // Check if SSL certificates exist
 const sslKeyPath = path.join(__dirname, "ssl", "key.pem");
@@ -83,11 +102,130 @@ function readServerSettings() {
   }
 }
 
+function hashPassword(password, salt) {
+  const normalized = String(password || "");
+  const normalizedSalt = String(salt || "");
+  return crypto.pbkdf2Sync(normalized, normalizedSalt, 120000, 64, "sha512").toString("hex");
+}
+
+function makeSalt() {
+  return crypto.randomBytes(16).toString("hex");
+}
+
+function makeSessionToken() {
+  return crypto.randomBytes(32).toString("hex");
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function getAuditContext(req, fallbackScannedBy = "Unknown") {
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  const scannedBy = String(body.scanned_by || req.headers["x-scanned-by"] || fallbackScannedBy || "Unknown").trim() || "Unknown";
+  const actorId = String(body.actor_id || req.user?.username || req.headers["x-actor-id"] || "anonymous").trim() || "anonymous";
+  const clientSessionId = String(body.client_session_id || req.headers["x-client-session-id"] || "unknown").trim() || "unknown";
+  const idempotencyKey = String(body.idempotency_key || req.headers["x-idempotency-key"] || "").trim();
+  return { scannedBy, actorId, clientSessionId, idempotencyKey };
+}
+
+function checkIdempotencyDuplicate(idempotencyKey, done) {
+  if (!idempotencyKey) return done(null, false);
+  db.get("SELECT id FROM activity_log WHERE idempotency_key = ? LIMIT 1", [idempotencyKey], (err, row) => {
+    if (err) return done(err);
+    return done(null, Boolean(row));
+  });
+}
+
+function checkRecentDuplicateAction({ palletId, action, location, quantityChanged }, done) {
+  db.get(
+    `SELECT id FROM activity_log
+     WHERE pallet_id = ?
+       AND action = ?
+       AND COALESCE(location, '') = COALESCE(?, '')
+       AND COALESCE(quantity_changed, 0) = COALESCE(?, 0)
+       AND datetime(timestamp) >= datetime('now', '-4 seconds')
+     LIMIT 1`,
+    [palletId, action, location || "", Number(quantityChanged) || 0],
+    (err, row) => {
+      if (err) return done(err);
+      return done(null, Boolean(row));
+    }
+  );
+}
+
 // Initialize database
 const db = new sqlite3.Database("./warehouse.db", (err) => {
   if (err) console.error("Database connection error:", err);
   else console.log("✓ Connected to warehouse database");
 });
+
+function getAuthTokenFromRequest(req) {
+  const auth = String(req.headers.authorization || "").trim();
+  if (auth.toLowerCase().startsWith("bearer ")) return auth.slice(7).trim();
+  const headerToken = String(req.headers["x-auth-token"] || "").trim();
+  if (headerToken) return headerToken;
+  return "";
+}
+
+function requireAuth(req, res, next) {
+  const token = getAuthTokenFromRequest(req);
+  if (!token) return res.status(401).json({ error: "Authentication required" });
+
+  db.get(
+    `SELECT s.token, s.user_id, s.expires_at, u.username, u.role, u.display_name, u.customer_scope, u.is_active
+     FROM user_sessions s
+     JOIN users u ON u.id = s.user_id
+     WHERE s.token = ?`,
+    [token],
+    (err, row) => {
+      if (err) return res.status(500).json({ error: "DB error" });
+      if (!row) return res.status(401).json({ error: "Invalid session" });
+      if (String(row.is_active || "1") !== "1") return res.status(401).json({ error: "User inactive" });
+      if (Date.parse(String(row.expires_at || "")) < Date.now()) {
+        db.run("DELETE FROM user_sessions WHERE token = ?", [token]);
+        return res.status(401).json({ error: "Session expired" });
+      }
+
+      db.run("UPDATE user_sessions SET last_seen_at = ? WHERE token = ?", [nowIso(), token]);
+
+      req.user = {
+        id: row.user_id,
+        username: row.username,
+        role: row.role,
+        display_name: row.display_name || row.username,
+        customer_scope: row.customer_scope || "*",
+        token,
+      };
+      return next();
+    }
+  );
+}
+
+function getScopedCustomers(req) {
+  const scopeRaw = String(req.user?.customer_scope || "*").trim();
+  if (!scopeRaw || scopeRaw === "*") return null;
+  const items = scopeRaw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return items.length ? items : null;
+}
+
+function applyCustomerScope({ requestedCustomer, scopedCustomers }) {
+  const reqCust = String(requestedCustomer || "").trim();
+  if (!scopedCustomers || scopedCustomers.length === 0) return reqCust || null;
+  if (reqCust) {
+    return scopedCustomers.includes(reqCust) ? reqCust : "__FORBIDDEN_SCOPE__";
+  }
+  return scopedCustomers;
+}
+
+function isCustomerAllowedForUser(req, customerName) {
+  const scoped = getScopedCustomers(req);
+  if (!scoped || scoped.length === 0) return true;
+  return scoped.includes(String(customerName || "").trim());
+}
 
 // Create tables
 db.serialize(() => {
@@ -104,6 +242,7 @@ db.serialize(() => {
       const hasParts = columns.some((col) => col.name === "parts");
       const hasCurrentUnits = columns.some((col) => col.name === "current_units");
       const hasScannedBy = columns.some((col) => col.name === "scanned_by");
+      const hasVersion = columns.some((col) => col.name === "version");
 
       if (hasQuantity && !hasPalletQuantity) {
         console.log("🔄 Migrating database to new schema...");
@@ -154,6 +293,14 @@ db.serialize(() => {
           else console.log("✓ scanned_by column added");
         });
       }
+
+      if (!hasVersion) {
+        console.log("🔄 Adding version column...");
+        db.run("ALTER TABLE pallets ADD COLUMN version INTEGER NOT NULL DEFAULT 0", (err) => {
+          if (err) console.error("Error adding version column:", err);
+          else console.log("✓ version column added");
+        });
+      }
     }
   });
 
@@ -169,6 +316,7 @@ db.serialize(() => {
       location TEXT NOT NULL,
       parts TEXT,
       scanned_by TEXT DEFAULT 'Unknown',
+      version INTEGER NOT NULL DEFAULT 0,
       date_added DATETIME DEFAULT CURRENT_TIMESTAMP,
       date_removed DATETIME,
       status TEXT DEFAULT 'active'
@@ -208,6 +356,9 @@ db.serialize(() => {
       location TEXT,
       notes TEXT,
       scanned_by TEXT DEFAULT 'Unknown',
+      actor_id TEXT DEFAULT 'anonymous',
+      client_session_id TEXT DEFAULT 'unknown',
+      idempotency_key TEXT,
       timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
     )`,
     (err) => {
@@ -220,6 +371,9 @@ db.serialize(() => {
   db.all("PRAGMA table_info(activity_log)", (err, columns) => {
     if (!err && columns) {
       const hasScannedBy = columns.some((col) => col.name === "scanned_by");
+      const hasActorId = columns.some((col) => col.name === "actor_id");
+      const hasClientSessionId = columns.some((col) => col.name === "client_session_id");
+      const hasIdempotencyKey = columns.some((col) => col.name === "idempotency_key");
       if (!hasScannedBy) {
         console.log("🔄 Adding scanned_by to activity_log...");
         db.run("ALTER TABLE activity_log ADD COLUMN scanned_by TEXT DEFAULT 'Unknown'", (err) => {
@@ -227,7 +381,63 @@ db.serialize(() => {
           else console.log("✓ scanned_by column added to activity_log");
         });
       }
+      if (!hasActorId) {
+        db.run("ALTER TABLE activity_log ADD COLUMN actor_id TEXT DEFAULT 'anonymous'");
+      }
+      if (!hasClientSessionId) {
+        db.run("ALTER TABLE activity_log ADD COLUMN client_session_id TEXT DEFAULT 'unknown'");
+      }
+      if (!hasIdempotencyKey) {
+        db.run("ALTER TABLE activity_log ADD COLUMN idempotency_key TEXT");
+      }
     }
+  });
+
+  // Auth users table
+  db.run(
+    `CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      password_salt TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'ops',
+      display_name TEXT,
+      customer_scope TEXT NOT NULL DEFAULT '*',
+      is_active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )`
+  );
+
+  // Auth sessions table
+  db.run(
+    `CREATE TABLE IF NOT EXISTS user_sessions (
+      token TEXT PRIMARY KEY,
+      user_id INTEGER NOT NULL,
+      expires_at TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      last_seen_at TEXT,
+      FOREIGN KEY(user_id) REFERENCES users(id)
+    )`
+  );
+
+  // Ensure there is at least one bootstrap admin
+  db.get("SELECT COUNT(*) AS c FROM users", (err, row) => {
+    if (err) return;
+    if (Number(row?.c || 0) > 0) return;
+
+    const adminUser = String(process.env.WT_BOOTSTRAP_USER || "admin").trim() || "admin";
+    const adminPass = String(process.env.WT_BOOTSTRAP_PASS || "admin123!").trim() || "admin123!";
+    const salt = makeSalt();
+    const hash = hashPassword(adminPass, salt);
+    db.run(
+      "INSERT INTO users (username, password_hash, password_salt, role, display_name, customer_scope, is_active) VALUES (?, ?, ?, 'owner', 'Owner', '*', 1)",
+      [adminUser, hash, salt],
+      (insErr) => {
+        if (!insErr) {
+          console.log(`✓ Bootstrap login created: ${adminUser} / ${adminPass}`);
+        }
+      }
+    );
   });
 
   // Populate locations if empty
@@ -265,16 +475,210 @@ db.serialize(() => {
 // API ROUTES
 // =====================
 
+app.post("/api/auth/login", (req, res) => {
+  const username = String(req.body?.username || "").trim();
+  const password = String(req.body?.password || "");
+  if (!username || !password) {
+    return res.status(400).json({ error: "username and password are required" });
+  }
+
+  db.get("SELECT * FROM users WHERE username = ?", [username], (err, user) => {
+    if (err) return res.status(500).json({ error: "DB error" });
+    if (!user || Number(user.is_active || 0) !== 1) {
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
+
+    const expected = hashPassword(password, user.password_salt);
+    if (expected !== user.password_hash) {
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
+
+    const token = makeSessionToken();
+    const expiresAt = new Date(Date.now() + (8 * 60 * 60 * 1000)).toISOString(); // 8h
+    db.run(
+      "INSERT INTO user_sessions (token, user_id, expires_at, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?)",
+      [token, user.id, expiresAt, nowIso(), nowIso()],
+      (insErr) => {
+        if (insErr) return res.status(500).json({ error: "DB error" });
+        return res.json({
+          ok: true,
+          token,
+          user: {
+            id: user.id,
+            username: user.username,
+            role: user.role,
+            display_name: user.display_name || user.username,
+            customer_scope: user.customer_scope || "*",
+          },
+          expires_at: expiresAt,
+        });
+      }
+    );
+  });
+});
+
+app.use("/api", (req, res, next) => {
+  if (req.path === "/auth/login") return next();
+  return requireAuth(req, res, next);
+});
+
+app.get("/api/auth/me", (req, res) => {
+  return res.json({
+    ok: true,
+    user: {
+      id: req.user.id,
+      username: req.user.username,
+      role: req.user.role,
+      display_name: req.user.display_name || req.user.username,
+      customer_scope: req.user.customer_scope || "*",
+    },
+  });
+});
+
+app.post("/api/auth/logout", (req, res) => {
+  const token = req.user?.token || getAuthTokenFromRequest(req);
+  if (!token) return res.json({ ok: true });
+  db.run("DELETE FROM user_sessions WHERE token = ?", [token], () => {
+    return res.json({ ok: true });
+  });
+});
+
+app.get("/api/auth/users", requireAdminRole, (req, res) => {
+  db.all(
+    "SELECT id, username, role, display_name, customer_scope, is_active, created_at FROM users ORDER BY id ASC",
+    (err, rows) => {
+      if (err) return res.status(500).json({ error: "DB error" });
+      return res.json(rows || []);
+    }
+  );
+});
+
+app.post("/api/auth/users", requireAdminRole, (req, res) => {
+  const username = String(req.body?.username || "").trim();
+  const password = String(req.body?.password || "");
+  const role = String(req.body?.role || "ops").trim().toLowerCase();
+  const displayName = String(req.body?.display_name || username).trim();
+  const customerScope = String(req.body?.customer_scope || "*").trim() || "*";
+  const isActive = Number(req.body?.is_active ?? 1) ? 1 : 0;
+  const allowedRoles = new Set(["owner", "admin", "ops", "viewer"]);
+
+  if (!username || !password) return res.status(400).json({ error: "username and password are required" });
+  if (!allowedRoles.has(role)) return res.status(400).json({ error: "Invalid role" });
+  if (password.length < 8) return res.status(400).json({ error: "Password must be at least 8 characters" });
+
+  const salt = makeSalt();
+  const hash = hashPassword(password, salt);
+  db.run(
+    "INSERT INTO users (username, password_hash, password_salt, role, display_name, customer_scope, is_active) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    [username, hash, salt, role, displayName, customerScope, isActive],
+    function onInsert(err) {
+      if (err) return res.status(400).json({ error: err.message || "Unable to create user" });
+      return res.json({ ok: true, id: this.lastID });
+    }
+  );
+});
+
+app.patch("/api/auth/users/:id", requireAdminRole, (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: "Invalid user id" });
+
+  db.get("SELECT * FROM users WHERE id = ?", [id], (err, user) => {
+    if (err) return res.status(500).json({ error: "DB error" });
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    const allowedRoles = new Set(["owner", "admin", "ops", "viewer"]);
+    const roleRaw = req.body?.role;
+    const displayRaw = req.body?.display_name;
+    const scopeRaw = req.body?.customer_scope;
+    const activeRaw = req.body?.is_active;
+    const passwordRaw = req.body?.password;
+
+    const updates = [];
+    const params = [];
+
+    if (roleRaw !== undefined) {
+      const role = String(roleRaw || "").trim().toLowerCase();
+      if (!allowedRoles.has(role)) return res.status(400).json({ error: "Invalid role" });
+      updates.push("role = ?");
+      params.push(role);
+    }
+
+    if (displayRaw !== undefined) {
+      updates.push("display_name = ?");
+      params.push(String(displayRaw || "").trim());
+    }
+
+    if (scopeRaw !== undefined) {
+      const scope = String(scopeRaw || "*").trim() || "*";
+      updates.push("customer_scope = ?");
+      params.push(scope);
+    }
+
+    if (activeRaw !== undefined) {
+      const isActive = Number(activeRaw) ? 1 : 0;
+      updates.push("is_active = ?");
+      params.push(isActive);
+    }
+
+    if (passwordRaw !== undefined && String(passwordRaw).length > 0) {
+      const nextPassword = String(passwordRaw);
+      if (nextPassword.length < 8) return res.status(400).json({ error: "Password must be at least 8 characters" });
+      const salt = makeSalt();
+      const hash = hashPassword(nextPassword, salt);
+      updates.push("password_hash = ?", "password_salt = ?");
+      params.push(hash, salt);
+    }
+
+    if (!updates.length) return res.status(400).json({ error: "No update fields provided" });
+
+    const requestedRole = roleRaw !== undefined ? String(roleRaw || "").trim().toLowerCase() : String(user.role || "").toLowerCase();
+    const requestedActive = activeRaw !== undefined ? (Number(activeRaw) ? 1 : 0) : Number(user.is_active || 0);
+    const wouldDemoteOrDisableOwner = String(user.role || "").toLowerCase() === "owner" && (requestedRole !== "owner" || requestedActive !== 1);
+
+    const runUpdate = () => {
+      params.push(id);
+      db.run(`UPDATE users SET ${updates.join(", ")} WHERE id = ?`, params, function onUpdate(upErr) {
+        if (upErr) return res.status(500).json({ error: "DB error" });
+        if (this.changes === 0) return res.status(404).json({ error: "User not found" });
+        db.get(
+          "SELECT id, username, role, display_name, customer_scope, is_active, created_at FROM users WHERE id = ?",
+          [id],
+          (selErr, row) => {
+            if (selErr) return res.status(500).json({ error: "DB error" });
+            return res.json({ ok: true, user: row });
+          }
+        );
+      });
+    };
+
+    if (!wouldDemoteOrDisableOwner) return runUpdate();
+
+    db.get("SELECT COUNT(*) AS c FROM users WHERE role = 'owner' AND is_active = 1", (countErr, countRow) => {
+      if (countErr) return res.status(500).json({ error: "DB error" });
+      if (Number(countRow?.c || 0) <= 1) {
+        return res.status(400).json({ error: "At least one active owner is required" });
+      }
+      return runUpdate();
+    });
+  });
+});
+
 // Get all active pallets
 app.get("/api/pallets", (req, res) => {
   const { customer } = req.query;
+  const scopedCustomers = getScopedCustomers(req);
+  const scoped = applyCustomerScope({ requestedCustomer: customer, scopedCustomers });
+  if (scoped === "__FORBIDDEN_SCOPE__") return res.json([]);
 
   let query = 'SELECT * FROM pallets WHERE status = "active"';
   let params = [];
 
-  if (customer) {
+  if (Array.isArray(scoped)) {
+    query += ` AND customer_name IN (${scoped.map(() => "?").join(",")})`;
+    params.push(...scoped);
+  } else if (scoped) {
     query += " AND customer_name = ?";
-    params.push(customer);
+    params.push(scoped);
   }
 
   query += " ORDER BY date_added DESC";
@@ -294,24 +698,28 @@ app.get("/api/pallets", (req, res) => {
 // Search pallets
 app.get("/api/pallets/search", (req, res) => {
   const { q } = req.query;
-  db.all(
-    'SELECT * FROM pallets WHERE status = "active" AND (product_id LIKE ? OR location LIKE ? OR customer_name LIKE ?) ORDER BY date_added DESC',
-    [`%${q}%`, `%${q}%`, `%${q}%`],
-    (err, rows) => {
-      if (err) return res.status(500).json({ error: err.message });
+  const scopedCustomers = getScopedCustomers(req);
+  let query = 'SELECT * FROM pallets WHERE status = "active" AND (product_id LIKE ? OR location LIKE ? OR customer_name LIKE ?)';
+  const params = [`%${q}%`, `%${q}%`, `%${q}%`];
+  if (Array.isArray(scopedCustomers)) {
+    query += ` AND customer_name IN (${scopedCustomers.map(() => "?").join(",")})`;
+    params.push(...scopedCustomers);
+  }
+  query += " ORDER BY date_added DESC";
+  db.all(query, params, (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
 
-      const palletsWithParts = rows.map((row) => ({
-        ...row,
-        parts: safeParseParts(row.parts),
-      }));
+    const palletsWithParts = rows.map((row) => ({
+      ...row,
+      parts: safeParseParts(row.parts),
+    }));
 
-      res.json(palletsWithParts);
-    }
-  );
+    res.json(palletsWithParts);
+  });
 });
 
 // Check in a pallet
-app.post("/api/pallets", (req, res) => {
+app.post("/api/pallets", requireWriteRole, (req, res) => {
   const {
     id,
     customer_name,
@@ -326,347 +734,569 @@ app.post("/api/pallets", (req, res) => {
   if (!customer_name || !product_id || !location) {
     return res.status(400).json({ error: "Customer name, Product ID and location required" });
   }
+  if (!isCustomerAllowedForUser(req, customer_name)) {
+    return res.status(403).json({ error: "Customer outside your scope" });
+  }
 
   const palletId = id || `PLT-${Date.now()}`;
   const partsJson = parts ? JSON.stringify(parts) : null;
   const palletQty = Number(pallet_quantity) || 1;
   const unitsPerPallet = Number(product_quantity) || 0;
   const currentUnits = palletQty * unitsPerPallet;
-  const scannedByPerson = scanned_by || "Unknown";
+  const audit = getAuditContext(req, scanned_by || "Unknown");
+  const scannedByPerson = audit.scannedBy;
 
-  db.run(
-    "INSERT INTO pallets (id, customer_name, product_id, pallet_quantity, product_quantity, current_units, location, parts, scanned_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    [
-      palletId,
-      customer_name,
-      product_id,
-      palletQty,
-      unitsPerPallet,
-      currentUnits,
-      location,
-      partsJson,
-      scannedByPerson,
-    ],
-    function (err) {
-      if (err) return res.status(500).json({ error: err.message });
+  checkIdempotencyDuplicate(audit.idempotencyKey, (dupErr, isDup) => {
+    if (dupErr) return res.status(500).json({ error: dupErr.message });
+    if (isDup) return res.json({ ok: true, deduped: true, message: "Duplicate request ignored" });
 
-      db.run("UPDATE locations SET is_occupied = 1 WHERE id = ?", [location]);
+    db.run(
+      "INSERT INTO pallets (id, customer_name, product_id, pallet_quantity, product_quantity, current_units, location, parts, scanned_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      [
+        palletId,
+        customer_name,
+        product_id,
+        palletQty,
+        unitsPerPallet,
+        currentUnits,
+        location,
+        partsJson,
+        scannedByPerson,
+      ],
+      function (err) {
+        if (err) return res.status(500).json({ error: err.message });
 
-      db.run(
-        "INSERT INTO activity_log (pallet_id, customer_name, product_id, action, quantity_changed, quantity_after, location) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        [
-          palletId,
+        db.run("UPDATE locations SET is_occupied = 1 WHERE id = ?", [location]);
+
+        db.run(
+          "INSERT INTO activity_log (pallet_id, customer_name, product_id, action, quantity_changed, quantity_after, location, scanned_by, actor_id, client_session_id, idempotency_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          [
+            palletId,
+            customer_name,
+            product_id,
+            "CHECK_IN",
+            palletQty,
+            palletQty,
+            location,
+            scannedByPerson,
+            audit.actorId,
+            audit.clientSessionId,
+            audit.idempotencyKey || null,
+          ]
+        );
+
+        res.json({
+          id: palletId,
           customer_name,
           product_id,
-          "CHECK_IN",
-          palletQty,
-          palletQty,
+          pallet_quantity: palletQty,
+          product_quantity: unitsPerPallet,
           location,
-        ]
-      );
+          parts: parts || null,
+          message: "Pallet checked in successfully",
+        });
 
-      res.json({
-        id: palletId,
-        customer_name,
-        product_id,
-        pallet_quantity: palletQty,
-        product_quantity: unitsPerPallet,
-        location,
-        parts: parts || null,
-        message: "Pallet checked in successfully",
-      });
+        broadcastInventoryChange("add_pallet", {
+          id: palletId,
+          customer_name,
+          product_id,
+          pallet_quantity: palletQty,
+          product_quantity: unitsPerPallet,
+          current_units: currentUnits,
+          location,
+          parts,
+          scanned_by: scannedByPerson,
+        });
+      }
+    );
+  });
+});
 
-      broadcastInventoryChange("add_pallet", {
-        id: palletId,
-        customer_name,
-        product_id,
-        pallet_quantity: palletQty,
-        product_quantity: unitsPerPallet,
-        current_units: currentUnits,
-        location,
-        parts,
-        scanned_by: scannedByPerson,
-      });
-    }
-  );
+// Move a pallet to a different location
+app.post("/api/pallets/:id/move", requireWriteRole, (req, res) => {
+  const id = req.params.id;
+  const toLocation = String(req.body?.to_location || "").trim().toUpperCase();
+  const audit = getAuditContext(req, "Scan");
+  const scannedBy = audit.scannedBy;
+
+  if (!toLocation) {
+    return res.status(400).json({ error: "to_location is required" });
+  }
+
+  checkIdempotencyDuplicate(audit.idempotencyKey, (dupErr, isDup) => {
+    if (dupErr) return res.status(500).json({ error: dupErr.message });
+    if (isDup) return res.json({ ok: true, deduped: true, message: "Duplicate request ignored" });
+
+    db.get(
+      'SELECT * FROM pallets WHERE (id = ? OR product_id = ?) AND status = "active"',
+      [id, id],
+      (err, row) => {
+        if (err) return res.status(500).json({ error: err.message });
+        if (!row) return res.status(404).json({ error: "Pallet not found or already removed" });
+
+      const palletId = row.id;
+      const fromLocation = String(row.location || "").toUpperCase();
+      if (!isCustomerAllowedForUser(req, row.customer_name)) {
+        return res.status(403).json({ error: "Customer outside your scope" });
+      }
+
+        if (!fromLocation) {
+          return res.status(400).json({ error: "Pallet has no current location" });
+        }
+        if (fromLocation === toLocation) {
+          return res.json({
+            ok: true,
+            id: palletId,
+            from_location: fromLocation,
+            to_location: toLocation,
+            message: "Pallet already in that location",
+          });
+        }
+
+        checkRecentDuplicateAction(
+          { palletId, action: "MOVE", location: toLocation, quantityChanged: 0 },
+          (recentErr, isRecentDup) => {
+            if (recentErr) return res.status(500).json({ error: recentErr.message });
+            if (isRecentDup) return res.json({ ok: true, deduped: true, message: "Duplicate move ignored" });
+
+            db.get("SELECT id FROM locations WHERE id = ?", [toLocation], (locErr, locRow) => {
+              if (locErr) return res.status(500).json({ error: locErr.message });
+              if (!locRow) return res.status(400).json({ error: `Unknown location: ${toLocation}` });
+
+              db.get(
+                'SELECT COUNT(*) AS cnt FROM pallets WHERE status = "active" AND location = ? AND id != ?',
+                [toLocation, palletId],
+                (occErr, occRow) => {
+                  if (occErr) return res.status(500).json({ error: occErr.message });
+                  if (Number(occRow?.cnt || 0) > 0) {
+                    return res.status(409).json({ error: `Target location ${toLocation} is occupied` });
+                  }
+
+                  db.run(
+                    "UPDATE pallets SET location = ?, version = version + 1 WHERE id = ? AND version = ?",
+                    [toLocation, palletId, Number(row.version) || 0],
+                    function onMove(moveErr) {
+                      if (moveErr) return res.status(500).json({ error: moveErr.message });
+                      if (this.changes === 0) {
+                        return res.status(409).json({ error: "Pallet was updated by another user. Refresh and retry." });
+                      }
+
+                      db.get(
+                        'SELECT COUNT(*) AS cnt FROM pallets WHERE status = "active" AND location = ?',
+                        [fromLocation],
+                        (oldCntErr, oldCntRow) => {
+                          if (oldCntErr) return res.status(500).json({ error: oldCntErr.message });
+                          const oldOccupied = Number(oldCntRow?.cnt || 0) > 0 ? 1 : 0;
+
+                          db.run("UPDATE locations SET is_occupied = ? WHERE id = ?", [oldOccupied, fromLocation]);
+                          db.run("UPDATE locations SET is_occupied = 1 WHERE id = ?", [toLocation]);
+
+                          db.run(
+                            "INSERT INTO activity_log (pallet_id, customer_name, product_id, action, quantity_changed, quantity_before, quantity_after, location, notes, scanned_by, actor_id, client_session_id, idempotency_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            [
+                              palletId,
+                              row.customer_name,
+                              row.product_id,
+                              "MOVE",
+                              0,
+                              Number(row.pallet_quantity) || 0,
+                              Number(row.pallet_quantity) || 0,
+                              toLocation,
+                              `Moved from ${fromLocation} to ${toLocation}`,
+                              scannedBy,
+                              audit.actorId,
+                              audit.clientSessionId,
+                              audit.idempotencyKey || null,
+                            ]
+                          );
+
+                          const payload = {
+                            id: palletId,
+                            customer_name: row.customer_name,
+                            product_id: row.product_id,
+                            pallet_quantity: Number(row.pallet_quantity) || 0,
+                            product_quantity: Number(row.product_quantity) || 0,
+                            from_location: fromLocation,
+                            to_location: toLocation,
+                            scanned_by: scannedBy,
+                          };
+
+                          broadcastInventoryChange("move_pallet", payload);
+                          return res.json({ ok: true, ...payload, message: "Pallet moved successfully" });
+                        }
+                      );
+                    }
+                  );
+                }
+              );
+            });
+          }
+        );
+      }
+    );
+  });
 });
 
 // Partial quantity removal
-app.post("/api/pallets/:id/remove-quantity", (req, res) => {
+app.post("/api/pallets/:id/remove-quantity", requireWriteRole, (req, res) => {
   const { id } = req.params;
   const { quantity_to_remove, scanned_by } = req.body;
-  const scannedByPerson = scanned_by || "Unknown";
+  const audit = getAuditContext(req, scanned_by || "Unknown");
+  const scannedByPerson = audit.scannedBy;
 
   if (!quantity_to_remove || quantity_to_remove <= 0) {
     return res.status(400).json({ error: "Valid quantity required" });
   }
 
-  db.get(
-    'SELECT * FROM pallets WHERE (id = ? OR product_id = ?) AND status = "active"',
-    [id, id],
-    (err, row) => {
-      if (err) return res.status(500).json({ error: err.message });
-      if (!row) return res.status(404).json({ error: "Pallet not found" });
+  checkIdempotencyDuplicate(audit.idempotencyKey, (dupErr, isDup) => {
+    if (dupErr) return res.status(500).json({ error: dupErr.message });
+    if (isDup) return res.json({ ok: true, deduped: true, message: "Duplicate request ignored" });
 
-      const quantityBefore = row.pallet_quantity;
-      const quantityAfter = quantityBefore - quantity_to_remove;
+    db.get(
+      'SELECT * FROM pallets WHERE (id = ? OR product_id = ?) AND status = "active"',
+      [id, id],
+      (err, row) => {
+        if (err) return res.status(500).json({ error: err.message });
+        if (!row) return res.status(404).json({ error: "Pallet not found" });
 
-      if (quantityAfter < 0) {
-        return res.status(400).json({ error: "Cannot remove more than available quantity" });
-      }
+        const quantityBefore = Number(row.pallet_quantity) || 0;
+        const qtyToRemove = Number(quantity_to_remove) || 0;
+        const quantityAfter = quantityBefore - qtyToRemove;
+        if (!isCustomerAllowedForUser(req, row.customer_name)) {
+          return res.status(403).json({ error: "Customer outside your scope" });
+        }
 
-      if (quantityAfter === 0) {
-        db.run(
-          'UPDATE pallets SET status = "removed", date_removed = CURRENT_TIMESTAMP, pallet_quantity = 0 WHERE id = ?',
-          [row.id],
-          (err) => {
-            if (err) return res.status(500).json({ error: err.message });
+        if (quantityAfter < 0) {
+          return res.status(400).json({ error: "Cannot remove more than available quantity" });
+        }
 
-            db.run("UPDATE locations SET is_occupied = 0 WHERE id = ?", [row.location]);
+        checkRecentDuplicateAction(
+          { palletId: row.id, action: "PARTIAL_REMOVE", location: row.location, quantityChanged: qtyToRemove },
+          (recentErr, isRecentDup) => {
+            if (recentErr) return res.status(500).json({ error: recentErr.message });
+            if (isRecentDup) return res.json({ ok: true, deduped: true, message: "Duplicate removal ignored" });
 
-            db.run(
-              "INSERT INTO activity_log (pallet_id, customer_name, product_id, action, quantity_changed, quantity_before, quantity_after, location, notes, scanned_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-              [
-                row.id,
-                row.customer_name,
-                row.product_id,
-                "PARTIAL_REMOVE",
-                quantity_to_remove,
-                quantityBefore,
-                0,
-                row.location,
-                "Pallet emptied and removed",
-                scannedByPerson,
-              ]
-            );
+            if (quantityAfter === 0) {
+              db.run(
+                'UPDATE pallets SET status = "removed", date_removed = CURRENT_TIMESTAMP, pallet_quantity = 0, version = version + 1 WHERE id = ? AND version = ?',
+                [row.id, Number(row.version) || 0],
+                function onRemoveAll(err) {
+                  if (err) return res.status(500).json({ error: err.message });
+                  if (this.changes === 0) {
+                    return res.status(409).json({ error: "Pallet was updated by another user. Refresh and retry." });
+                  }
 
-            res.json({
-              message: "All pallets removed. Location freed.",
-              quantity_removed: quantity_to_remove,
-              quantity_remaining: 0,
-              pallet_removed: true,
-            });
+                  db.run("UPDATE locations SET is_occupied = 0 WHERE id = ?", [row.location]);
 
-            broadcastInventoryChange("delete_pallet", {
-              customer_name: row.customer_name,
-              product_id: row.product_id,
-              location: row.location,
-              quantity_removed: quantity_to_remove,
-              scanned_by: scannedByPerson,
-            });
+                  db.run(
+                    "INSERT INTO activity_log (pallet_id, customer_name, product_id, action, quantity_changed, quantity_before, quantity_after, location, notes, scanned_by, actor_id, client_session_id, idempotency_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                      row.id,
+                      row.customer_name,
+                      row.product_id,
+                      "PARTIAL_REMOVE",
+                      qtyToRemove,
+                      quantityBefore,
+                      0,
+                      row.location,
+                      "Pallet emptied and removed",
+                      scannedByPerson,
+                      audit.actorId,
+                      audit.clientSessionId,
+                      audit.idempotencyKey || null,
+                    ]
+                  );
+
+                  res.json({
+                    message: "All pallets removed. Location freed.",
+                    quantity_removed: qtyToRemove,
+                    quantity_remaining: 0,
+                    pallet_removed: true,
+                  });
+
+                  broadcastInventoryChange("delete_pallet", {
+                    customer_name: row.customer_name,
+                    product_id: row.product_id,
+                    location: row.location,
+                    quantity_removed: qtyToRemove,
+                    scanned_by: scannedByPerson,
+                  });
+                }
+              );
+            } else {
+              db.run(
+                "UPDATE pallets SET pallet_quantity = ?, version = version + 1 WHERE id = ? AND version = ?",
+                [quantityAfter, row.id, Number(row.version) || 0],
+                function onRemoveSome(err) {
+                  if (err) return res.status(500).json({ error: err.message });
+                  if (this.changes === 0) {
+                    return res.status(409).json({ error: "Pallet was updated by another user. Refresh and retry." });
+                  }
+
+                  db.run(
+                    "INSERT INTO activity_log (pallet_id, customer_name, product_id, action, quantity_changed, quantity_before, quantity_after, location, scanned_by, actor_id, client_session_id, idempotency_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                      row.id,
+                      row.customer_name,
+                      row.product_id,
+                      "PARTIAL_REMOVE",
+                      qtyToRemove,
+                      quantityBefore,
+                      quantityAfter,
+                      row.location,
+                      scannedByPerson,
+                      audit.actorId,
+                      audit.clientSessionId,
+                      audit.idempotencyKey || null,
+                    ]
+                  );
+
+                  res.json({
+                    message: `Removed ${qtyToRemove} pallet(s). ${quantityAfter} remaining.`,
+                    quantity_removed: qtyToRemove,
+                    quantity_remaining: quantityAfter,
+                    pallet_removed: false,
+                  });
+
+                  broadcastInventoryChange("remove_pallets", {
+                    customer_name: row.customer_name,
+                    product_id: row.product_id,
+                    location: row.location,
+                    quantity_removed: qtyToRemove,
+                    quantity_remaining: quantityAfter,
+                    scanned_by: scannedByPerson,
+                  });
+                }
+              );
+            }
           }
         );
-      } else {
-        db.run(
-          "UPDATE pallets SET pallet_quantity = ? WHERE id = ?",
-          [quantityAfter, row.id],
-          (err) => {
-            if (err) return res.status(500).json({ error: err.message });
-
-            db.run(
-              "INSERT INTO activity_log (pallet_id, customer_name, product_id, action, quantity_changed, quantity_before, quantity_after, location, scanned_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-              [
-                row.id,
-                row.customer_name,
-                row.product_id,
-                "PARTIAL_REMOVE",
-                quantity_to_remove,
-                quantityBefore,
-                quantityAfter,
-                row.location,
-                scannedByPerson,
-              ]
-            );
-
-            res.json({
-              message: `Removed ${quantity_to_remove} pallet(s). ${quantityAfter} remaining.`,
-              quantity_removed: quantity_to_remove,
-              quantity_remaining: quantityAfter,
-              pallet_removed: false,
-            });
-
-            broadcastInventoryChange("remove_pallets", {
-              customer_name: row.customer_name,
-              product_id: row.product_id,
-              location: row.location,
-              quantity_removed: quantity_to_remove,
-              quantity_remaining: quantityAfter,
-              scanned_by: scannedByPerson,
-            });
-          }
-        );
       }
-    }
-  );
+    );
+  });
 });
 
 // Remove partial units from pallet
-app.post("/api/pallets/:id/remove-units", (req, res) => {
+app.post("/api/pallets/:id/remove-units", requireWriteRole, (req, res) => {
   const { id } = req.params;
   const { units_to_remove, scanned_by } = req.body;
-  const scannedByPerson = scanned_by || "Unknown";
+  const audit = getAuditContext(req, scanned_by || "Unknown");
+  const scannedByPerson = audit.scannedBy;
 
   if (!units_to_remove || units_to_remove <= 0) {
     return res.status(400).json({ error: "Valid unit quantity required" });
   }
 
-  db.get(
-    'SELECT * FROM pallets WHERE (id = ? OR product_id = ?) AND status = "active"',
-    [id, id],
-    (err, row) => {
-      if (err) return res.status(500).json({ error: err.message });
-      if (!row) return res.status(404).json({ error: "Pallet not found" });
+  checkIdempotencyDuplicate(audit.idempotencyKey, (dupErr, isDup) => {
+    if (dupErr) return res.status(500).json({ error: dupErr.message });
+    if (isDup) return res.json({ ok: true, deduped: true, message: "Duplicate request ignored" });
 
-      if (!row.product_quantity || row.product_quantity === 0) {
-        return res.status(400).json({
-          error: "This pallet does not track individual units. Use remove-quantity endpoint instead.",
-        });
-      }
+    db.get(
+      'SELECT * FROM pallets WHERE (id = ? OR product_id = ?) AND status = "active"',
+      [id, id],
+      (err, row) => {
+        if (err) return res.status(500).json({ error: err.message });
+        if (!row) return res.status(404).json({ error: "Pallet not found" });
 
-      const totalUnits = Number(row.current_units) || 0;
-      const unitsAfter = totalUnits - units_to_remove;
+        if (!row.product_quantity || row.product_quantity === 0) {
+          return res.status(400).json({
+            error: "This pallet does not track individual units. Use remove-quantity endpoint instead.",
+          });
+        }
 
-      if (unitsAfter < 0) {
-        return res.status(400).json({
-          error: `Cannot remove ${units_to_remove} units. Only ${totalUnits} units available.`,
-        });
-      }
+        const totalUnits = Number(row.current_units) || 0;
+        const unitsToRemove = Number(units_to_remove) || 0;
+        const unitsAfter = totalUnits - unitsToRemove;
+        if (!isCustomerAllowedForUser(req, row.customer_name)) {
+          return res.status(403).json({ error: "Customer outside your scope" });
+        }
 
-      if (unitsAfter === 0) {
-        db.run(
-          'UPDATE pallets SET status = "removed", date_removed = CURRENT_TIMESTAMP, pallet_quantity = 0, product_quantity = 0, current_units = 0 WHERE id = ?',
-          [row.id],
-          (err) => {
-            if (err) return res.status(500).json({ error: err.message });
+        if (unitsAfter < 0) {
+          return res.status(400).json({
+            error: `Cannot remove ${unitsToRemove} units. Only ${totalUnits} units available.`,
+          });
+        }
 
-            db.run("UPDATE locations SET is_occupied = 0 WHERE id = ?", [row.location]);
+        checkRecentDuplicateAction(
+          { palletId: row.id, action: "UNITS_REMOVE", location: row.location, quantityChanged: unitsToRemove },
+          (recentErr, isRecentDup) => {
+            if (recentErr) return res.status(500).json({ error: recentErr.message });
+            if (isRecentDup) return res.json({ ok: true, deduped: true, message: "Duplicate removal ignored" });
 
-            db.run(
-              "INSERT INTO activity_log (pallet_id, customer_name, product_id, action, quantity_changed, quantity_before, quantity_after, location, notes, scanned_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-              [
-                row.id,
-                row.customer_name,
-                row.product_id,
-                "UNITS_REMOVE",
-                units_to_remove,
-                totalUnits,
-                0,
-                row.location,
-                "All units removed. Pallet cleared.",
-                scannedByPerson,
-              ]
-            );
+            if (unitsAfter === 0) {
+              db.run(
+                'UPDATE pallets SET status = "removed", date_removed = CURRENT_TIMESTAMP, pallet_quantity = 0, product_quantity = 0, current_units = 0, version = version + 1 WHERE id = ? AND version = ?',
+                [row.id, Number(row.version) || 0],
+                function onRemoveAll(err) {
+                  if (err) return res.status(500).json({ error: err.message });
+                  if (this.changes === 0) {
+                    return res.status(409).json({ error: "Pallet was updated by another user. Refresh and retry." });
+                  }
 
-            res.json({
-              message: "All units removed. Location freed.",
-              units_removed: units_to_remove,
-              units_remaining: 0,
-              pallets_remaining: 0,
-              pallet_removed: true,
-            });
+                  db.run("UPDATE locations SET is_occupied = 0 WHERE id = ?", [row.location]);
 
-            broadcastInventoryChange("delete_pallet", {
-              customer_name: row.customer_name,
-              product_id: row.product_id,
-              location: row.location,
-              units_removed: units_to_remove,
-              scanned_by: scannedByPerson,
-            });
+                  db.run(
+                    "INSERT INTO activity_log (pallet_id, customer_name, product_id, action, quantity_changed, quantity_before, quantity_after, location, notes, scanned_by, actor_id, client_session_id, idempotency_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                      row.id,
+                      row.customer_name,
+                      row.product_id,
+                      "UNITS_REMOVE",
+                      unitsToRemove,
+                      totalUnits,
+                      0,
+                      row.location,
+                      "All units removed. Pallet cleared.",
+                      scannedByPerson,
+                      audit.actorId,
+                      audit.clientSessionId,
+                      audit.idempotencyKey || null,
+                    ]
+                  );
+
+                  res.json({
+                    message: "All units removed. Location freed.",
+                    units_removed: unitsToRemove,
+                    units_remaining: 0,
+                    pallets_remaining: 0,
+                    pallet_removed: true,
+                  });
+
+                  broadcastInventoryChange("delete_pallet", {
+                    customer_name: row.customer_name,
+                    product_id: row.product_id,
+                    location: row.location,
+                    units_removed: unitsToRemove,
+                    scanned_by: scannedByPerson,
+                  });
+                }
+              );
+            } else {
+              db.run(
+                "UPDATE pallets SET current_units = ?, version = version + 1 WHERE id = ? AND version = ?",
+                [unitsAfter, row.id, Number(row.version) || 0],
+                function onRemoveSome(err) {
+                  if (err) return res.status(500).json({ error: err.message });
+                  if (this.changes === 0) {
+                    return res.status(409).json({ error: "Pallet was updated by another user. Refresh and retry." });
+                  }
+
+                  db.run(
+                    "INSERT INTO activity_log (pallet_id, customer_name, product_id, action, quantity_changed, quantity_before, quantity_after, location, notes, scanned_by, actor_id, client_session_id, idempotency_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                      row.id,
+                      row.customer_name,
+                      row.product_id,
+                      "UNITS_REMOVE",
+                      unitsToRemove,
+                      totalUnits,
+                      unitsAfter,
+                      row.location,
+                      `Removed ${unitsToRemove} units. ${unitsAfter} total units remaining.`,
+                      scannedByPerson,
+                      audit.actorId,
+                      audit.clientSessionId,
+                      audit.idempotencyKey || null,
+                    ]
+                  );
+
+                  res.json({
+                    message: `Removed ${unitsToRemove} units. ${unitsAfter} total units remaining.`,
+                    units_removed: unitsToRemove,
+                    units_remaining: unitsAfter,
+                    pallets_remaining: row.pallet_quantity,
+                    units_per_pallet: row.product_quantity,
+                    current_units: unitsAfter,
+                    pallet_removed: false,
+                  });
+
+                  broadcastInventoryChange("remove_units", {
+                    customer_name: row.customer_name,
+                    product_id: row.product_id,
+                    location: row.location,
+                    units_removed: unitsToRemove,
+                    units_remaining: unitsAfter,
+                    scanned_by: scannedByPerson,
+                  });
+                }
+              );
+            }
           }
         );
-      } else {
-        db.run(
-          "UPDATE pallets SET current_units = ? WHERE id = ?",
-          [unitsAfter, row.id],
-          (err) => {
-            if (err) return res.status(500).json({ error: err.message });
-
-            db.run(
-              "INSERT INTO activity_log (pallet_id, customer_name, product_id, action, quantity_changed, quantity_before, quantity_after, location, notes, scanned_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-              [
-                row.id,
-                row.customer_name,
-                row.product_id,
-                "UNITS_REMOVE",
-                units_to_remove,
-                totalUnits,
-                unitsAfter,
-                row.location,
-                `Removed ${units_to_remove} units. ${unitsAfter} total units remaining.`,
-                scannedByPerson,
-              ]
-            );
-
-            res.json({
-              message: `Removed ${units_to_remove} units. ${unitsAfter} total units remaining.`,
-              units_removed: units_to_remove,
-              units_remaining: unitsAfter,
-              pallets_remaining: row.pallet_quantity,
-              units_per_pallet: row.product_quantity,
-              current_units: unitsAfter,
-              pallet_removed: false,
-            });
-
-            broadcastInventoryChange("remove_units", {
-              customer_name: row.customer_name,
-              product_id: row.product_id,
-              location: row.location,
-              units_removed: units_to_remove,
-              units_remaining: unitsAfter,
-              scanned_by: scannedByPerson,
-            });
-          }
-        );
       }
-    }
-  );
+    );
+  });
 });
 
 // Check out a pallet
-app.delete("/api/pallets/:id", (req, res) => {
+app.delete("/api/pallets/:id", requireWriteRole, (req, res) => {
   const { id } = req.params;
+  const audit = getAuditContext(req, "Scan");
 
-  db.get(
-    'SELECT * FROM pallets WHERE (id = ? OR product_id = ?) AND status = "active"',
-    [id, id],
-    (err, row) => {
-      if (err) return res.status(500).json({ error: err.message });
-      if (!row) return res.status(404).json({ error: "Pallet not found" });
+  checkIdempotencyDuplicate(audit.idempotencyKey, (dupErr, isDup) => {
+    if (dupErr) return res.status(500).json({ error: dupErr.message });
+    if (isDup) return res.json({ ok: true, deduped: true, message: "Duplicate request ignored" });
 
-      db.run(
-        'UPDATE pallets SET status = "removed", date_removed = CURRENT_TIMESTAMP WHERE id = ? OR product_id = ?',
-        [id, id],
-        (err) => {
-          if (err) return res.status(500).json({ error: err.message });
-
-          db.run("UPDATE locations SET is_occupied = 0 WHERE id = ?", [row.location]);
-
-          db.run(
-            "INSERT INTO activity_log (pallet_id, customer_name, product_id, action, quantity_changed, quantity_before, location, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            [
-              row.id,
-              row.customer_name,
-              row.product_id,
-              "CHECK_OUT",
-              row.pallet_quantity,
-              row.pallet_quantity,
-              row.location,
-              "Full pallet removed",
-            ]
-          );
-
-          res.json({ message: "Pallet checked out successfully" });
-
-          broadcastInventoryChange("delete_pallet", {
-            customer_name: row.customer_name,
-            product_id: row.product_id,
-            location: row.location,
-            scanned_by: row.scanned_by || "Unknown",
-          });
+    db.get(
+      'SELECT * FROM pallets WHERE (id = ? OR product_id = ?) AND status = "active"',
+      [id, id],
+      (err, row) => {
+        if (err) return res.status(500).json({ error: err.message });
+        if (!row) return res.status(404).json({ error: "Pallet not found" });
+        if (!isCustomerAllowedForUser(req, row.customer_name)) {
+          return res.status(403).json({ error: "Customer outside your scope" });
         }
-      );
-    }
-  );
+
+        checkRecentDuplicateAction(
+          { palletId: row.id, action: "CHECK_OUT", location: row.location, quantityChanged: Number(row.pallet_quantity) || 0 },
+          (recentErr, isRecentDup) => {
+            if (recentErr) return res.status(500).json({ error: recentErr.message });
+            if (isRecentDup) return res.json({ ok: true, deduped: true, message: "Duplicate check-out ignored" });
+
+            db.run(
+              'UPDATE pallets SET status = "removed", date_removed = CURRENT_TIMESTAMP, version = version + 1 WHERE id = ? AND version = ?',
+              [row.id, Number(row.version) || 0],
+              function onCheckout(err) {
+                if (err) return res.status(500).json({ error: err.message });
+                if (this.changes === 0) {
+                  return res.status(409).json({ error: "Pallet was updated by another user. Refresh and retry." });
+                }
+
+                db.run("UPDATE locations SET is_occupied = 0 WHERE id = ?", [row.location]);
+
+                db.run(
+                  "INSERT INTO activity_log (pallet_id, customer_name, product_id, action, quantity_changed, quantity_before, location, notes, scanned_by, actor_id, client_session_id, idempotency_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  [
+                    row.id,
+                    row.customer_name,
+                    row.product_id,
+                    "CHECK_OUT",
+                    row.pallet_quantity,
+                    row.pallet_quantity,
+                    row.location,
+                    "Full pallet removed",
+                    audit.scannedBy,
+                    audit.actorId,
+                    audit.clientSessionId,
+                    audit.idempotencyKey || null,
+                  ]
+                );
+
+                res.json({ message: "Pallet checked out successfully" });
+
+                broadcastInventoryChange("delete_pallet", {
+                  customer_name: row.customer_name,
+                  product_id: row.product_id,
+                  location: row.location,
+                  scanned_by: audit.scannedBy,
+                });
+              }
+            );
+          }
+        );
+      }
+    );
+  });
 });
 
 // Locations
@@ -680,13 +1310,21 @@ app.get("/api/locations", (req, res) => {
 // Stats
 app.get("/api/stats", (req, res) => {
   const { customer } = req.query;
+  const scopedCustomers = getScopedCustomers(req);
+  const scoped = applyCustomerScope({ requestedCustomer: customer, scopedCustomers });
+  if (scoped === "__FORBIDDEN_SCOPE__") {
+    return res.json({ total_pallets: 0, occupied_locations: 0, total_locations: 0 });
+  }
 
   let palletQuery = 'SELECT COUNT(*) as total_pallets FROM pallets WHERE status = "active"';
   let params = [];
 
-  if (customer) {
+  if (Array.isArray(scoped)) {
+    palletQuery += ` AND customer_name IN (${scoped.map(() => "?").join(",")})`;
+    params.push(...scoped);
+  } else if (scoped) {
     palletQuery += " AND customer_name = ?";
-    params.push(customer);
+    params.push(scoped);
   }
 
   db.get(palletQuery, params, (err, palletRow) => {
@@ -712,13 +1350,19 @@ app.get("/api/stats", (req, res) => {
 // Activity log
 app.get("/api/activity", (req, res) => {
   const { customer, limit } = req.query;
+  const scopedCustomers = getScopedCustomers(req);
+  const scoped = applyCustomerScope({ requestedCustomer: customer, scopedCustomers });
+  if (scoped === "__FORBIDDEN_SCOPE__") return res.json([]);
 
   let query = "SELECT * FROM activity_log";
   let params = [];
 
-  if (customer) {
+  if (Array.isArray(scoped)) {
+    query += ` WHERE customer_name IN (${scoped.map(() => "?").join(",")})`;
+    params.push(...scoped);
+  } else if (scoped) {
     query += " WHERE customer_name = ?";
-    params.push(customer);
+    params.push(scoped);
   }
 
   query += " ORDER BY timestamp DESC";
@@ -737,13 +1381,19 @@ app.get("/api/activity", (req, res) => {
 // Export to CSV
 app.get("/api/export", (req, res) => {
   const { customer } = req.query;
+  const scopedCustomers = getScopedCustomers(req);
+  const scoped = applyCustomerScope({ requestedCustomer: customer, scopedCustomers });
+  if (scoped === "__FORBIDDEN_SCOPE__") return res.send("Customer,Product ID,Pallet Qty,Product Qty,Location,Date Added");
 
   let query = 'SELECT * FROM pallets WHERE status = "active"';
   let params = [];
 
-  if (customer) {
+  if (Array.isArray(scoped)) {
+    query += ` AND customer_name IN (${scoped.map(() => "?").join(",")})`;
+    params.push(...scoped);
+  } else if (scoped) {
     query += " AND customer_name = ?";
-    params.push(customer);
+    params.push(scoped);
   }
 
   db.all(query, params, (err, rows) => {
@@ -766,13 +1416,12 @@ app.get("/api/export", (req, res) => {
 
 // Customers
 app.get("/api/customers", (req, res) => {
-  db.all(
-    'SELECT DISTINCT customer_name FROM pallets WHERE status = "active" ORDER BY customer_name',
-    (err, rows) => {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json(rows.map((r) => r.customer_name));
-    }
-  );
+  const scopedCustomers = getScopedCustomers(req);
+  if (Array.isArray(scopedCustomers)) return res.json(scopedCustomers);
+  db.all('SELECT DISTINCT customer_name FROM pallets WHERE status = "active" ORDER BY customer_name', (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(rows.map((r) => r.customer_name));
+  });
 });
 
 app.get("/api/settings", (req, res) => {
@@ -876,6 +1525,10 @@ db.serialize(() => {
     currency TEXT NOT NULL DEFAULT 'GBP',
     payment_terms_days INTEGER NOT NULL DEFAULT 7,
     due_date TEXT,
+    amount_paid REAL NOT NULL DEFAULT 0,
+    payment_status TEXT NOT NULL DEFAULT 'UNPAID',
+    payments_json TEXT,
+    last_payment_at TEXT,
     details_json TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   )`);
@@ -893,6 +1546,10 @@ db.serialize(() => {
     if (!has("currency")) db.run("ALTER TABLE invoices ADD COLUMN currency TEXT NOT NULL DEFAULT 'GBP'");
     if (!has("payment_terms_days")) db.run("ALTER TABLE invoices ADD COLUMN payment_terms_days INTEGER NOT NULL DEFAULT 7");
     if (!has("due_date")) db.run("ALTER TABLE invoices ADD COLUMN due_date TEXT");
+    if (!has("amount_paid")) db.run("ALTER TABLE invoices ADD COLUMN amount_paid REAL NOT NULL DEFAULT 0");
+    if (!has("payment_status")) db.run("ALTER TABLE invoices ADD COLUMN payment_status TEXT NOT NULL DEFAULT 'UNPAID'");
+    if (!has("payments_json")) db.run("ALTER TABLE invoices ADD COLUMN payments_json TEXT");
+    if (!has("last_payment_at")) db.run("ALTER TABLE invoices ADD COLUMN last_payment_at TEXT");
     if (!has("details_json")) db.run("ALTER TABLE invoices ADD COLUMN details_json TEXT");
     if (!has("status")) db.run("ALTER TABLE invoices ADD COLUMN status TEXT NOT NULL DEFAULT 'DRAFT'");
     if (!has("sent_at")) db.run("ALTER TABLE invoices ADD COLUMN sent_at TEXT");
@@ -1064,22 +1721,27 @@ function buildInvoicePreview(input, done) {
 
 app.get("/api/rates", (req, res) => {
   const customer = String(req.query.customer || "").trim();
+  const scopedCustomers = getScopedCustomers(req);
+  const scoped = applyCustomerScope({ requestedCustomer: customer, scopedCustomers });
+  if (scoped === "__FORBIDDEN_SCOPE__") return res.status(404).json({ error: "Rate not found" });
   if (customer) {
-    db.get("SELECT * FROM customer_rates WHERE customer_name = ?", [customer], (err, row) => {
+    db.get("SELECT * FROM customer_rates WHERE customer_name = ?", [scoped], (err, row) => {
       if (err) return res.status(500).json({ error: "DB error" });
       if (!row) return res.status(404).json({ error: "Rate not found" });
       return res.json(row);
     });
     return;
   }
-
-  db.all("SELECT * FROM customer_rates ORDER BY customer_name ASC", (err, rows) => {
+  const sql = Array.isArray(scopedCustomers)
+    ? `SELECT * FROM customer_rates WHERE customer_name IN (${scopedCustomers.map(() => "?").join(",")}) ORDER BY customer_name ASC`
+    : "SELECT * FROM customer_rates ORDER BY customer_name ASC";
+  db.all(sql, Array.isArray(scopedCustomers) ? scopedCustomers : [], (err, rows) => {
     if (err) return res.status(500).json({ error: "DB error" });
     res.json(rows || []);
   });
 });
 
-app.post("/api/rates", (req, res) => {
+app.post("/api/rates", requireWriteRole, (req, res) => {
   const customerName = String(req.body?.customer_name || "").trim();
   const ratePerWeek = Number(req.body?.rate_per_pallet_week);
   const handlingFlat = Number(req.body?.handling_fee_flat || 0);
@@ -1089,6 +1751,9 @@ app.post("/api/rates", (req, res) => {
 
   if (!customerName || !Number.isFinite(ratePerWeek) || ratePerWeek < 0) {
     return res.status(400).json({ error: "customer_name and valid rate_per_pallet_week are required" });
+  }
+  if (!isCustomerAllowedForUser(req, customerName)) {
+    return res.status(403).json({ error: "Customer outside your scope" });
   }
   if (!Number.isFinite(handlingFlat) || handlingFlat < 0) {
     return res.status(400).json({ error: "handling_fee_flat must be a valid number >= 0" });
@@ -1123,24 +1788,99 @@ app.post("/api/rates", (req, res) => {
 
 app.get("/api/invoices", (req, res) => {
   const customer = String(req.query.customer || "").trim();
-  const sql = customer
-    ? "SELECT * FROM invoices WHERE customer_name = ? ORDER BY id DESC LIMIT 200"
-    : "SELECT * FROM invoices ORDER BY id DESC LIMIT 200";
+  const scopedCustomers = getScopedCustomers(req);
+  const scoped = applyCustomerScope({ requestedCustomer: customer, scopedCustomers });
+  if (scoped === "__FORBIDDEN_SCOPE__") return res.json([]);
 
-  db.all(sql, customer ? [customer] : [], (err, rows) => {
+  let sql = "SELECT * FROM invoices";
+  const params = [];
+  if (Array.isArray(scoped)) {
+    sql += ` WHERE customer_name IN (${scoped.map(() => "?").join(",")})`;
+    params.push(...scoped);
+  } else if (scoped) {
+    sql += " WHERE customer_name = ?";
+    params.push(scoped);
+  }
+  sql += " ORDER BY id DESC LIMIT 200";
+
+  db.all(sql, params, (err, rows) => {
     if (err) return res.status(500).json({ error: "DB error" });
     res.json(rows || []);
   });
 });
 
+app.get("/api/invoices/aging", (req, res) => {
+  const scopedCustomers = getScopedCustomers(req);
+  const sql = Array.isArray(scopedCustomers)
+    ? `SELECT * FROM invoices WHERE customer_name IN (${scopedCustomers.map(() => "?").join(",")}) ORDER BY id DESC LIMIT 1000`
+    : "SELECT * FROM invoices ORDER BY id DESC LIMIT 1000";
+  db.all(sql, Array.isArray(scopedCustomers) ? scopedCustomers : [], (err, rows) => {
+    if (err) return res.status(500).json({ error: "DB error" });
+
+    const today = new Date();
+    const todayUtcStart = Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate());
+    const buckets = {
+      current: { count: 0, amount: 0 },
+      d1_30: { count: 0, amount: 0 },
+      d31_60: { count: 0, amount: 0 },
+      d61_plus: { count: 0, amount: 0 },
+    };
+
+    for (const inv of rows || []) {
+      const total = Number(inv.total || 0);
+      const paid = Number(inv.amount_paid || 0);
+      const balance = Number((total - paid).toFixed(2));
+      const status = String(inv.status || "").toUpperCase();
+      if (balance <= 0 || status === "PAID") continue;
+
+      const due = String(inv.due_date || "").trim();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(due)) {
+        buckets.current.count += 1;
+        buckets.current.amount = Number((buckets.current.amount + balance).toFixed(2));
+        continue;
+      }
+
+      const dueMs = Date.parse(`${due}T00:00:00Z`);
+      if (!Number.isFinite(dueMs) || dueMs >= todayUtcStart) {
+        buckets.current.count += 1;
+        buckets.current.amount = Number((buckets.current.amount + balance).toFixed(2));
+        continue;
+      }
+
+      const days = Math.floor((todayUtcStart - dueMs) / (24 * 60 * 60 * 1000));
+      if (days <= 30) {
+        buckets.d1_30.count += 1;
+        buckets.d1_30.amount = Number((buckets.d1_30.amount + balance).toFixed(2));
+      } else if (days <= 60) {
+        buckets.d31_60.count += 1;
+        buckets.d31_60.amount = Number((buckets.d31_60.amount + balance).toFixed(2));
+      } else {
+        buckets.d61_plus.count += 1;
+        buckets.d61_plus.amount = Number((buckets.d61_plus.amount + balance).toFixed(2));
+      }
+    }
+
+    const total_outstanding = Number(
+      (buckets.current.amount + buckets.d1_30.amount + buckets.d31_60.amount + buckets.d61_plus.amount).toFixed(2)
+    );
+    const total_count = buckets.current.count + buckets.d1_30.count + buckets.d31_60.count + buckets.d61_plus.count;
+
+    return res.json({ ok: true, buckets, total_outstanding, total_count });
+  });
+});
+
 app.post("/api/invoices/preview", (req, res) => {
+  const customerName = String(req.body?.customer_name || "").trim();
+  if (customerName && !isCustomerAllowedForUser(req, customerName)) {
+    return res.status(403).json({ error: "Customer outside your scope" });
+  }
   buildInvoicePreview(req.body || {}, (err, preview) => {
     if (err) return res.status(400).json({ error: err.message || "Invalid invoice inputs" });
     res.json(preview);
   });
 });
 
-app.post("/api/invoices/generate", (req, res) => {
+app.post("/api/invoices/generate", requireWriteRole, (req, res) => {
   const customerName = String(req.body?.customer_name || "").trim();
   let startDate = String(req.body?.start_date || "").trim();
   let endDate = String(req.body?.end_date || "").trim();
@@ -1152,6 +1892,9 @@ app.post("/api/invoices/generate", (req, res) => {
 
   if (!customerName || !startDate || !endDate) {
     return res.status(400).json({ error: "customer_name and either (start_date + end_date) or week_start are required" });
+  }
+  if (!isCustomerAllowedForUser(req, customerName)) {
+    return res.status(403).json({ error: "Customer outside your scope" });
   }
 
   const previewInput = {
@@ -1212,7 +1955,7 @@ app.post("/api/invoices/generate", (req, res) => {
   });
 });
 
-app.post("/api/invoices/:id/status", (req, res) => {
+app.post("/api/invoices/:id/status", requireWriteRole, (req, res) => {
   const id = Number(req.params.id);
   const status = String(req.body?.status || "").trim().toUpperCase();
   const allowed = new Set(["DRAFT", "SENT", "PAID"]);
@@ -1227,6 +1970,9 @@ app.post("/api/invoices/:id/status", (req, res) => {
   db.get("SELECT * FROM invoices WHERE id = ?", [id], (getErr, current) => {
     if (getErr) return res.status(500).json({ error: "DB error" });
     if (!current) return res.status(404).json({ error: "Invoice not found" });
+    if (!isCustomerAllowedForUser(req, current.customer_name)) {
+      return res.status(403).json({ error: "Customer outside your scope" });
+    }
 
     const nowIso = new Date().toISOString();
     let sentAt = current.sent_at || null;
@@ -1255,6 +2001,82 @@ app.post("/api/invoices/:id/status", (req, res) => {
         db.get("SELECT * FROM invoices WHERE id = ?", [id], (err2, row) => {
           if (err2) return res.status(500).json({ error: "DB error" });
           return res.json({ ok: true, invoice: row });
+        });
+      }
+    );
+  });
+});
+
+app.post("/api/invoices/:id/payments", requireWriteRole, (req, res) => {
+  const id = Number(req.params.id);
+  const amount = Number(req.body?.amount);
+  const note = String(req.body?.note || "").trim();
+  const paidAt = String(req.body?.paid_at || "").trim() || new Date().toISOString();
+
+  if (!Number.isInteger(id) || id <= 0) {
+    return res.status(400).json({ error: "Invalid invoice id" });
+  }
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return res.status(400).json({ error: "amount must be > 0" });
+  }
+
+  db.get("SELECT * FROM invoices WHERE id = ?", [id], (getErr, inv) => {
+    if (getErr) return res.status(500).json({ error: "DB error" });
+    if (!inv) return res.status(404).json({ error: "Invoice not found" });
+    if (!isCustomerAllowedForUser(req, inv.customer_name)) {
+      return res.status(403).json({ error: "Customer outside your scope" });
+    }
+
+    const total = Number(inv.total || 0);
+    const currentPaid = Number(inv.amount_paid || 0);
+    const nextPaid = Number((currentPaid + amount).toFixed(2));
+    const balance = Number((total - nextPaid).toFixed(2));
+
+    let payments = [];
+    try {
+      const parsed = JSON.parse(inv.payments_json || "[]");
+      payments = Array.isArray(parsed) ? parsed : [];
+    } catch {
+      payments = [];
+    }
+    payments.push({
+      amount: Number(amount.toFixed(2)),
+      note,
+      paid_at: paidAt,
+    });
+
+    const paymentStatus = balance <= 0 ? "PAID" : "PARTIAL";
+    const nextInvoiceStatus = balance <= 0 ? "PAID" : (String(inv.status || "").toUpperCase() === "DRAFT" ? "SENT" : String(inv.status || "").toUpperCase() || "SENT");
+    const paidFullAt = balance <= 0 ? paidAt : null;
+    const sentAt = inv.sent_at || paidAt;
+
+    db.run(
+      `UPDATE invoices
+       SET amount_paid = ?, payment_status = ?, payments_json = ?, last_payment_at = ?,
+           status = ?, sent_at = ?, paid_at = ?
+       WHERE id = ?`,
+      [
+        nextPaid,
+        paymentStatus,
+        JSON.stringify(payments),
+        paidAt,
+        nextInvoiceStatus,
+        sentAt,
+        paidFullAt,
+        id,
+      ],
+      function onPaid(updateErr) {
+        if (updateErr) return res.status(500).json({ error: "DB error" });
+        if (this.changes === 0) return res.status(404).json({ error: "Invoice not found" });
+
+        db.get("SELECT * FROM invoices WHERE id = ?", [id], (err2, row) => {
+          if (err2) return res.status(500).json({ error: "DB error" });
+          return res.json({
+            ok: true,
+            invoice: row,
+            payment: { amount: Number(amount.toFixed(2)), note, paid_at: paidAt },
+            balance_due: Number((Number(row.total || 0) - Number(row.amount_paid || 0)).toFixed(2)),
+          });
         });
       }
     );
